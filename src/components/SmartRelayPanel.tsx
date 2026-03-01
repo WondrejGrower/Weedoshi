@@ -4,9 +4,10 @@ import { smartRelaySelector } from '../lib/smartRelaySelector';
 
 interface SmartRelayPanelProps {
   onSelectionChanged?: () => void;
+  allowBackgroundProbe?: boolean;
 }
 
-export function SmartRelayPanel({ onSelectionChanged }: SmartRelayPanelProps) {
+export function SmartRelayPanel({ onSelectionChanged, allowBackgroundProbe = true }: SmartRelayPanelProps) {
   const [isAuto, setIsAuto] = useState(smartRelaySelector.isAuto());
   const [stats, setStats] = useState(smartRelaySelector.getStats());
   const [rankedRelays, setRankedRelays] = useState(smartRelaySelector.getRankedRelays());
@@ -18,10 +19,31 @@ export function SmartRelayPanel({ onSelectionChanged }: SmartRelayPanelProps) {
   };
 
   useEffect(() => {
-    // Refresh data periodically
-    const interval = setInterval(refreshData, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    let disposed = false;
+
+    if (allowBackgroundProbe) {
+      // Initial background probe on mount (non-blocking for UI)
+      smartRelaySelector.refreshRelayLatency().finally(() => {
+        if (!disposed) refreshData();
+      });
+    }
+
+    // Refresh data and periodically apply auto smart selection
+    const interval = setInterval(async () => {
+      if (allowBackgroundProbe) {
+        await smartRelaySelector.refreshRelayLatency();
+      }
+      const didUpdateSelection = smartRelaySelector.periodicUpdate();
+      if (didUpdateSelection && onSelectionChanged) {
+        onSelectionChanged();
+      }
+      refreshData();
+    }, 15000);
+    return () => {
+      disposed = true;
+      clearInterval(interval);
+    };
+  }, [onSelectionChanged, allowBackgroundProbe]);
 
   const handleToggleAuto = () => {
     if (isAuto) {
@@ -35,7 +57,8 @@ export function SmartRelayPanel({ onSelectionChanged }: SmartRelayPanelProps) {
     refreshData();
   };
 
-  const handleManualSelect = () => {
+  const handleManualSelect = async () => {
+    await smartRelaySelector.refreshRelayLatency(true);
     smartRelaySelector.applySmartSelection();
     if (onSelectionChanged) {
       onSelectionChanged();
@@ -70,7 +93,7 @@ export function SmartRelayPanel({ onSelectionChanged }: SmartRelayPanelProps) {
           <Text style={styles.statLabel}>Enabled</Text>
         </View>
         <View style={styles.statBox}>
-          <Text style={styles.statValue}>{stats.avgLatency}ms</Text>
+          <Text style={styles.statValue}>{stats.avgLatency === '—' ? '—' : `${stats.avgLatency}ms`}</Text>
           <Text style={styles.statLabel}>Avg Latency</Text>
         </View>
         <View style={styles.statBox}>
@@ -99,7 +122,7 @@ export function SmartRelayPanel({ onSelectionChanged }: SmartRelayPanelProps) {
                 {relay.url.replace('wss://', '')}
               </Text>
               <Text style={styles.previewMetrics}>
-                {relay.latency.toFixed(0)}ms · {(relay.successRate * 100).toFixed(0)}% · 
+                {relay.latency > 0 ? `${relay.latency.toFixed(0)}ms` : '—'} · {(relay.successRate * 100).toFixed(0)}% ·
                 Score: {relay.score.toFixed(1)}
               </Text>
             </View>

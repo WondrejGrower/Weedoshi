@@ -1,6 +1,7 @@
 import { relayHealthMonitor } from './relayHealthMonitor';
 import { relayManager } from './relayManager';
 import { diagnostics } from './diagnostics';
+import { relayLatencyProbe } from './relayLatencyProbe';
 
 interface RelayScore {
   url: string;
@@ -19,6 +20,10 @@ export class SmartRelaySelector {
   private maxRelays: number = 3;
   private lastSelectionTime: number = 0;
   private selectionIntervalMs: number = 60000; // Re-evaluate every minute
+  private lastProbeTime: number = 0;
+  private probeIntervalMs: number = 120000; // Probe at most every 2 minutes
+  private probeTimeoutMs: number = 1500;
+  private probeInProgress: boolean = false;
 
   /**
    * Calculate a performance score for a relay
@@ -163,10 +168,57 @@ export class SmartRelaySelector {
   /**
    * Periodic re-evaluation (call this periodically if auto is enabled)
    */
-  periodicUpdate(): void {
+  periodicUpdate(): boolean {
     if (this.shouldReEvaluate()) {
       console.log('🔄 Re-evaluating relay selection...');
       this.applySmartSelection();
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Probe relays in the background using WebSocket open latency.
+   * Results are cached by RelayLatencyProbe and throttled here.
+   */
+  async refreshRelayLatency(force: boolean = false): Promise<boolean> {
+    if (this.probeInProgress) {
+      return false;
+    }
+
+    const now = Date.now();
+    if (!force && now - this.lastProbeTime < this.probeIntervalMs) {
+      return false;
+    }
+
+    this.probeInProgress = true;
+    try {
+      const relayUrls = relayManager.getAllRelays().map(relay => relay.url);
+      if (relayUrls.length === 0) return false;
+
+      diagnostics.log(`Probing ${relayUrls.length} relays (timeout ${this.probeTimeoutMs}ms)`, 'info');
+      const results = await relayLatencyProbe.measureRelays(relayUrls, this.probeTimeoutMs);
+      this.lastProbeTime = Date.now();
+
+      for (const result of results) {
+        relayHealthMonitor.initRelay(result.url);
+        relayHealthMonitor.recordConnectionAttempt(result.url);
+
+        if (result.ok && result.latency !== null) {
+          relayHealthMonitor.recordLatency(result.url, result.latency);
+        } else {
+          relayHealthMonitor.recordFailure(result.url, result.error || 'Probe failed');
+        }
+      }
+
+      const successCount = results.filter(r => r.ok).length;
+      diagnostics.log(`Relay probe complete: ${successCount}/${results.length} successful`, 'info');
+      return true;
+    } catch (error) {
+      diagnostics.log(`Relay probe failed: ${error}`, 'warn');
+      return false;
+    } finally {
+      this.probeInProgress = false;
     }
   }
 
@@ -187,6 +239,9 @@ export class SmartRelaySelector {
       maxRelays: this.maxRelays,
       lastSelectionTime: this.lastSelectionTime,
       timeSinceLastSelection: Date.now() - this.lastSelectionTime,
+      lastProbeTime: this.lastProbeTime,
+      timeSinceLastProbe: Date.now() - this.lastProbeTime,
+      probeInProgress: this.probeInProgress,
     };
   }
 
@@ -197,17 +252,20 @@ export class SmartRelaySelector {
     const ranked = this.getRankedRelays();
     const viable = ranked.filter(r => r.score > 0);
     const enabled = relayManager.getEnabledUrls();
+    const avgLatency =
+      viable.length > 0
+        ? Math.round(viable.reduce((sum, r) => sum + r.latency, 0) / viable.length)
+        : null;
+
     return {
       totalRelays: ranked.length,
       viableRelays: viable.length,
       enabledRelays: enabled.length,
       autoEnabled: this.isAutoEnabled,
-      avgScore: viable.length > 0 
+      avgScore: viable.length > 0
         ? (viable.reduce((sum, r) => sum + r.score, 0) / viable.length).toFixed(1)
-        : 0,
-      avgLatency: viable.length > 0
-        ? (viable.reduce((sum, r) => sum + r.latency, 0) / viable.length).toFixed(0)
-        : 0,
+        : '—',
+      avgLatency: avgLatency === null ? '—' : `${avgLatency}`,
     };
   }
 }

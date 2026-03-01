@@ -2,13 +2,20 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { nostrClient } from './nostrClient';
 import { secureKeyManager } from './secureKeyManager';
 import { diagnostics } from './diagnostics';
+import { getFeatures } from '../runtime/features';
+import { getRuntimeMode } from '../runtime/mode';
 
 export interface AuthState {
   isLoggedIn: boolean;
   isReadOnly: boolean;
   pubkey: string | null;
   privkey: string | null;
-  method: 'nsec' | 'npub' | null;
+  method: 'nsec' | 'npub' | 'signer' | null;
+}
+
+interface BrowserSigner {
+  getPublicKey?: () => Promise<string>;
+  signEvent?: (event: any) => Promise<any>;
 }
 
 class AuthManager {
@@ -30,10 +37,20 @@ class AuthManager {
 
   async loginWithNsec(nsec: string) {
     try {
-      const { pubkey, privkey } = nostrClient.decodeNsec(nsec);
+      const features = getFeatures(getRuntimeMode());
+      if (!features.allowNsecLogin) {
+        throw new Error('nsec login is disabled in web mode. Connect a browser signer instead.');
+      }
+
+      const normalized = nsec.trim();
+      if (!normalized.startsWith('nsec1')) {
+        throw new Error('Invalid nsec format. Expected key starting with nsec1...');
+      }
+
+      const { pubkey, privkey } = nostrClient.decodeNsec(normalized);
 
       // Store nsec securely using SecureKeyManager
-      await secureKeyManager.storeKey(nsec, pubkey);
+      await secureKeyManager.storeKey(normalized, pubkey);
       this.state = {
         isLoggedIn: true,
         isReadOnly: false,
@@ -67,6 +84,47 @@ class AuthManager {
     } catch (error) {
       diagnostics.log(`❌ Failed to login with npub: ${error instanceof Error ? error.message : ''}`, 'error');
       throw new Error(`Failed to login with npub: ${error instanceof Error ? error.message : ''}`);
+    }
+  }
+
+  isBrowserSignerAvailable(): boolean {
+    if (typeof window === 'undefined') return false;
+    const signer = (window as any).nostr as BrowserSigner | undefined;
+    return typeof signer?.getPublicKey === 'function';
+  }
+
+  private canBrowserSignerSign(): boolean {
+    if (typeof window === 'undefined') return false;
+    const signer = (window as any).nostr as BrowserSigner | undefined;
+    return typeof signer?.signEvent === 'function';
+  }
+
+  async loginWithBrowserSigner() {
+    try {
+      if (!this.isBrowserSignerAvailable()) {
+        throw new Error('No browser signer found (NIP-07/Nostr Connect provider missing)');
+      }
+
+      const signer = (window as any).nostr as BrowserSigner;
+      const pubkey = await signer.getPublicKey!();
+      if (!pubkey) {
+        throw new Error('Signer did not return a public key');
+      }
+
+      this.state = {
+        isLoggedIn: true,
+        isReadOnly: !this.canBrowserSignerSign(),
+        pubkey,
+        privkey: null,
+        method: 'signer',
+      };
+      await this.saveToStorage();
+      diagnostics.log(`✅ Connected browser signer: ${pubkey.substring(0, 8)}...`, 'info');
+    } catch (error) {
+      diagnostics.log(`❌ Failed to connect browser signer: ${error instanceof Error ? error.message : ''}`, 'error');
+      throw new Error(
+        `Failed to connect browser signer: ${error instanceof Error ? error.message : ''}`
+      );
     }
   }
 
@@ -110,11 +168,12 @@ class AuthManager {
       const stored = await AsyncStorage.getItem('nostr_auth');
       if (stored) {
         const data = JSON.parse(stored);
+        const features = getFeatures(getRuntimeMode());
         if (data.pubkey && data.method) {
           // Check if we have a secure key stored
           const hasSecureKey = await secureKeyManager.hasKey();
 
-          if (data.method === 'nsec' && hasSecureKey) {
+          if (data.method === 'nsec' && hasSecureKey && features.allowNsecLogin) {
             // Load nsec from secure storage
             const nsec = await secureKeyManager.getKey();
             if (nsec) {
@@ -149,6 +208,17 @@ class AuthManager {
             };
             diagnostics.log('✅ Restored npub login (read-only)', 'info');
             console.log('Restored auth state from storage (read-only)');
+          }
+
+          if (data.method === 'signer') {
+            this.state = {
+              isLoggedIn: true,
+              isReadOnly: !this.canBrowserSignerSign(),
+              pubkey: data.pubkey,
+              privkey: null,
+              method: 'signer',
+            };
+            diagnostics.log('✅ Restored signer login state', 'info');
           }
         }
       }

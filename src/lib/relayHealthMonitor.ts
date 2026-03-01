@@ -194,9 +194,10 @@ export class RelayHealthMonitor {
     const errorRelays = relays.filter(r => r.status === 'error').length;
     
     const totalEvents = relays.reduce((sum, r) => sum + r.eventsReceived, 0);
-    const avgLatency = relays.length > 0
-      ? Math.round(relays.reduce((sum, r) => sum + r.avgLatency, 0) / relays.length)
-      : 0;
+    const relaysWithLatency = relays.filter(r => r.avgLatency > 0);
+    const avgLatency = relaysWithLatency.length > 0
+      ? Math.round(relaysWithLatency.reduce((sum, r) => sum + r.avgLatency, 0) / relaysWithLatency.length)
+      : null;
     
     return {
       totalRelays,

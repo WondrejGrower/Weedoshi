@@ -3,6 +3,19 @@ import type { Event, Filter } from 'nostr-tools';
 import { finalizeEvent, SimplePool } from 'nostr-tools';
 import { batchRequestManager } from './batchRequestManager';
 
+function hexToBytes(hex: string): Uint8Array {
+  const normalized = hex.trim().toLowerCase();
+  if (!/^[0-9a-f]+$/.test(normalized) || normalized.length % 2 !== 0) {
+    throw new Error('Invalid private key hex format');
+  }
+
+  const bytes = new Uint8Array(normalized.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(normalized.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
 interface Reaction {
   id: string;
   pubkey: string;
@@ -14,6 +27,11 @@ interface ReactionGroup {
   emoji: string;
   count: number;
   pubkeys: string[];
+}
+
+interface BrowserSigner {
+  getPublicKey?: () => Promise<string>;
+  signEvent?: (event: any) => Promise<any>;
 }
 
 /**
@@ -36,7 +54,7 @@ export class ReactionManager {
     emoji: string,
     eventId: string,
     eventAuthor: string,
-    privkey: string,
+    privkey: string | Uint8Array,
     relayUrls: string[]
   ): Promise<void> {
     try {
@@ -54,7 +72,8 @@ export class ReactionManager {
       };
 
       // Sign the event with private key
-      const signedEvent = finalizeEvent(reactionEvent, privkey as any);
+      const secretKey = typeof privkey === 'string' ? hexToBytes(privkey) : privkey;
+      const signedEvent = finalizeEvent(reactionEvent, secretKey as any);
 
       // Publish to all relays (at least one must succeed)
       const publishPromises = relayUrls.map(relay =>
@@ -69,6 +88,49 @@ export class ReactionManager {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
       diagnostics.log(`❌ Failed to publish reaction: ${errorMsg}`, 'error');
       throw new Error(`Failed to publish reaction: ${errorMsg}`);
+    }
+  }
+
+  async publishReactionWithSigner(
+    emoji: string,
+    eventId: string,
+    eventAuthor: string,
+    relayUrls: string[]
+  ): Promise<void> {
+    if (typeof window === 'undefined') {
+      throw new Error('Browser signer is only available in web runtime');
+    }
+
+    const signer = (window as any).nostr as BrowserSigner | undefined;
+    if (!signer || typeof signer.getPublicKey !== 'function' || typeof signer.signEvent !== 'function') {
+      throw new Error('Browser signer (NIP-07) is not available');
+    }
+
+    try {
+      const pubkey = await signer.getPublicKey();
+      const unsignedEvent = {
+        kind: 7,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [
+          ['e', eventId],
+          ['p', eventAuthor],
+        ],
+        content: emoji,
+        pubkey,
+      };
+
+      const signedEvent = await signer.signEvent(unsignedEvent);
+      if (!signedEvent?.id || !signedEvent?.sig) {
+        throw new Error('Signer did not return a valid signed event');
+      }
+
+      const publishPromises = relayUrls.map(relay => this.pool.publish([relay], signedEvent));
+      await Promise.race(publishPromises);
+      diagnostics.log(`✅ Reaction ${emoji} published via browser signer`, 'info');
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      diagnostics.log(`❌ Failed to publish signer reaction: ${errorMsg}`, 'error');
+      throw new Error(`Failed to publish reaction via signer: ${errorMsg}`);
     }
   }
 

@@ -13,8 +13,7 @@ interface RetryState {
 export class ConnectionRetry {
   private retryState: Map<string, RetryState> = new Map();
   private maxRetries = 5;
-  private baseDelay = 1000; // 1 second
-  private maxDelay = 32000; // 32 seconds
+  private maxDelay = 30000; // 30 seconds
 
   /**
    * Execute a connection with retry logic
@@ -69,9 +68,10 @@ export class ConnectionRetry {
    * Formula: min(baseDelay * 2^attempt, maxDelay) with jitter
    */
   private calculateBackoff(attempt: number): number {
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s
-    const exponentialDelay = this.baseDelay * Math.pow(2, attempt);
-    const cappedDelay = Math.min(exponentialDelay, this.maxDelay);
+    // Practical stepped backoff: 2s, 5s, 10s, 20s, 30s...
+    const schedule = [2000, 5000, 10000, 20000, 30000];
+    const baseDelay = schedule[Math.min(attempt, schedule.length - 1)];
+    const cappedDelay = Math.min(baseDelay, this.maxDelay);
     
     // Add jitter (±20%) to prevent thundering herd
     const jitter = cappedDelay * 0.2 * (Math.random() - 0.5);

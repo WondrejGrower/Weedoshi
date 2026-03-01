@@ -99,3 +99,39 @@ export function filterAndDeduplicateEvents(
   
   return filtered.sort((a, b) => b.created_at - a.created_at);
 }
+
+/**
+ * Deduplicate and format events without hashtag filtering.
+ * Used as a safe fallback when strict hashtag matching yields no results.
+ */
+export function deduplicateAndFormatEvents(events: NostrEvent[]): FilteredEvent[] {
+  const seen = new Set<string>();
+  const formatted: FilteredEvent[] = [];
+
+  for (const event of events) {
+    if (seen.has(event.id)) {
+      continue;
+    }
+    seen.add(event.id);
+
+    const hashtags = getAllHashtags(event);
+    const date = new Date(event.created_at * 1000);
+    const timestamp = date.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+    formatted.push({
+      ...event,
+      hashtags,
+      timestamp,
+      author: event.pubkey,
+      id: event.id,
+      content: event.content,
+    });
+  }
+
+  return formatted.sort((a, b) => b.created_at - a.created_at);
+}

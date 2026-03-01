@@ -24,10 +24,14 @@ export function ReactionBar({
   const [showPicker, setShowPicker] = useState(false);
 
   const reactions = reactionManager.getReactions(eventId);
+  const canUseBrowserSigner =
+    authState.method === 'signer' &&
+    typeof window !== 'undefined' &&
+    typeof (window as any).nostr?.signEvent === 'function';
 
   const handleReact = async (emoji: string) => {
-    if (!authState.isLoggedIn || authState.isReadOnly || !authState.privkey) {
-      Alert.alert('Login Required', 'You need to login with nsec to react to posts');
+    if (!authState.isLoggedIn) {
+      Alert.alert('Login Required', 'You need to login to react to posts');
       return;
     }
 
@@ -35,13 +39,27 @@ export function ReactionBar({
       setIsReacting(true);
       setShowPicker(false);
 
-      await reactionManager.publishReaction(
-        emoji,
-        eventId,
-        eventAuthor,
-        authState.privkey,
-        relayUrls
-      );
+      if (canUseBrowserSigner) {
+        await reactionManager.publishReactionWithSigner(
+          emoji,
+          eventId,
+          eventAuthor,
+          relayUrls
+        );
+      } else {
+        if (authState.isReadOnly || !authState.privkey) {
+          Alert.alert('Login Required', 'Use nsec login or browser signer with signing permission');
+          return;
+        }
+
+        await reactionManager.publishReaction(
+          emoji,
+          eventId,
+          eventAuthor,
+          authState.privkey,
+          relayUrls
+        );
+      }
 
       // Trigger refresh
       if (onReactionAdded) {
@@ -79,7 +97,7 @@ export function ReactionBar({
         ))}
 
         {/* Add reaction button */}
-        {authState.isLoggedIn && !authState.isReadOnly && (
+        {authState.isLoggedIn && (!authState.isReadOnly || canUseBrowserSigner) && (
           <TouchableOpacity
             style={styles.addButton}
             onPress={() => setShowPicker(!showPicker)}

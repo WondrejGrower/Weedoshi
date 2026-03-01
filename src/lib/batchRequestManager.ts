@@ -176,6 +176,8 @@ export class BatchRequestManager {
 
     try {
       const allEvents: Event[] = [];
+      let isSettled = false;
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
       // Subscribe with combined filters
       const sub = this.pool.subscribeMany(
@@ -186,21 +188,31 @@ export class BatchRequestManager {
             allEvents.push(event);
           },
           oneose: () => {
+            if (isSettled) return;
+            isSettled = true;
             // Distribute events to respective callbacks
             this.distributeEvents(requests, allEvents);
             this.stats.totalEventsFetched += allEvents.length;
             sub.close();
+            if (timeoutId) {
+              clearTimeout(timeoutId);
+            }
           },
         }
       );
 
       // Timeout after 3 seconds
-      setTimeout(() => {
+      timeoutId = setTimeout(() => {
+        if (isSettled) return;
+        isSettled = true;
         sub.close();
         if (allEvents.length > 0) {
           this.distributeEvents(requests, allEvents);
           this.stats.totalEventsFetched += allEvents.length;
+          return;
         }
+        // No events: still resolve requests once with an empty result
+        this.distributeEvents(requests, []);
       }, 3000);
     } catch (error) {
       diagnostics.log(`Batch execution error: ${error}`, 'error');

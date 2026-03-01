@@ -4,7 +4,7 @@ Thank you to everyone who has contributed to making Weedoshi Diaries (WD) better
 
 ## Core Team
 
-- **Ondřej** - Founder, Product Lead
+- **Wondrej D. Grower & LLM's** - Founder, Product Lead
   - Conceptualized the idea of a decentralized cannabis community feed
   - Guided product development and feature prioritization
   - Cannabis community expertise

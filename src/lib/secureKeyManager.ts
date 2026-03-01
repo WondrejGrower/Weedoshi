@@ -1,9 +1,54 @@
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 import { diagnostics } from './diagnostics';
+import { getFeatures } from '../runtime/features';
+import { getRuntimeMode } from '../runtime/mode';
 
 const STORAGE_KEY = 'nostr_private_key';
 const PUBKEY_KEY = 'nostr_public_key';
+const WEB_APP_ENCRYPTED_PREFIX = 'enc:v1:';
+const WEB_APP_FALLBACK_SECRET = 'weedoshi-web-app-storage';
+
+function toBase64(value: string): string {
+  if (typeof btoa === 'function') {
+    return btoa(value);
+  }
+  return Buffer.from(value, 'utf-8').toString('base64');
+}
+
+function fromBase64(value: string): string {
+  if (typeof atob === 'function') {
+    return atob(value);
+  }
+  return Buffer.from(value, 'base64').toString('utf-8');
+}
+
+function xorCipher(input: string, secret: string): string {
+  let output = '';
+  for (let i = 0; i < input.length; i++) {
+    const charCode = input.charCodeAt(i) ^ secret.charCodeAt(i % secret.length);
+    output += String.fromCharCode(charCode);
+  }
+  return output;
+}
+
+function encryptForWeb(nsec: string, pubkey: string): string {
+  const cipher = xorCipher(nsec, `${WEB_APP_FALLBACK_SECRET}:${pubkey}`);
+  return `${WEB_APP_ENCRYPTED_PREFIX}${toBase64(cipher)}`;
+}
+
+function decryptForWeb(payload: string, pubkey: string): string | null {
+  try {
+    if (!payload.startsWith(WEB_APP_ENCRYPTED_PREFIX)) {
+      return payload;
+    }
+    const encoded = payload.slice(WEB_APP_ENCRYPTED_PREFIX.length);
+    const cipher = fromBase64(encoded);
+    return xorCipher(cipher, `${WEB_APP_FALLBACK_SECRET}:${pubkey}`);
+  } catch {
+    return null;
+  }
+}
 
 /**
  * SecureKeyManager handles secure storage of Nostr keys
@@ -18,9 +63,17 @@ export class SecureKeyManager {
   async storeKey(nsec: string, pubkey: string): Promise<void> {
     try {
       if (Platform.OS === 'web') {
-        // Web fallback - use localStorage with warning
-        diagnostics.log('⚠️ Web platform: Using localStorage (not fully secure)', 'warn');
-        localStorage.setItem(STORAGE_KEY, nsec);
+        const features = getFeatures(getRuntimeMode());
+        if (features.requireBrowserSigner) {
+          throw new Error('nsec storage is disabled in web mode');
+        }
+
+        // App mode on web: encrypted fallback (still lower trust than native secure storage).
+        diagnostics.log(
+          '⚠️ Web app mode: Using encrypted localStorage fallback (prefer native secure storage)',
+          'warn'
+        );
+        localStorage.setItem(STORAGE_KEY, encryptForWeb(nsec, pubkey));
         localStorage.setItem(PUBKEY_KEY, pubkey);
       } else {
         // Native platforms - use secure storage
@@ -46,7 +99,15 @@ export class SecureKeyManager {
   async getKey(): Promise<string | null> {
     try {
       if (Platform.OS === 'web') {
-        return localStorage.getItem(STORAGE_KEY);
+        const features = getFeatures(getRuntimeMode());
+        if (features.requireBrowserSigner) {
+          return null;
+        }
+
+        const pubkey = localStorage.getItem(PUBKEY_KEY);
+        const payload = localStorage.getItem(STORAGE_KEY);
+        if (!payload || !pubkey) return null;
+        return decryptForWeb(payload, pubkey);
       } else {
         return await SecureStore.getItemAsync(STORAGE_KEY);
       }

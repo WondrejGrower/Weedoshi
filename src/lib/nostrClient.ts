@@ -10,6 +10,16 @@ export interface NostrEvent extends Event {
   relayUrl?: string;
 }
 
+export interface NostrProfileMetadata {
+  name?: string;
+  display_name?: string;
+  picture?: string;
+  banner?: string;
+  about?: string;
+  nip05?: string;
+  lud16?: string;
+}
+
 export class NostrClient {
   private pool: SimplePool;
   private relayUrls: string[] = [];
@@ -81,11 +91,10 @@ export class NostrClient {
       limit: 100,
     };
 
-    // Add hashtag filtering if hashtags are provided
+    // Keep relay query broad and apply hashtag filtering client-side.
+    // Many events use inline hashtags in content without explicit #t tags.
     if (hashtags && hashtags.length > 0) {
-      // Nostr uses #t tag for hashtags (lowercase)
-      filter['#t'] = hashtags.map(tag => tag.toLowerCase());
-      diagnostics.log(`Filtering by hashtags: ${hashtags.join(', ')}`, 'info');
+      diagnostics.log(`Client-side hashtag filtering: ${hashtags.join(', ')}`, 'info');
     }
 
     // 🚀 NEW: Load cached events first (instant feed!)
@@ -109,7 +118,6 @@ export class NostrClient {
     let timeoutFired = false;
     let eventCount = 0;
     let duplicateCount = 0;
-    const connectionStartTime = Date.now();
 
     // Timeout pro connection (5 sekund)
     const timeoutId = setTimeout(() => {
@@ -135,12 +143,6 @@ export class NostrClient {
           // Record success for the relay
           if (relay) {
             relayHealthMonitor.recordSuccess(relay);
-
-            // Record latency on first event from this relay
-            if (eventCount === 0) {
-              const latency = Date.now() - connectionStartTime;
-              relayHealthMonitor.recordLatency(relay, latency);
-            }
           }
           // 1. Validate event signature FIRST (security)
           if (!eventValidator.validateEvent(event)) {
@@ -206,6 +208,116 @@ export class NostrClient {
     }
   }
 
+  async fetchRecentPublicNotes(limit: number = 80, maxWaitMs: number = 6000): Promise<NostrEvent[]> {
+    if (this.relayUrls.length === 0) {
+      return [];
+    }
+
+    const filter: Filter = {
+      kinds: [1],
+      limit,
+    };
+
+    try {
+      const events = await this.pool.querySync(this.relayUrls, filter as any, {
+        maxWait: maxWaitMs,
+        label: 'fallback-public-notes',
+      });
+
+      return events
+        .filter((event) => eventValidator.validateEvent(event))
+        .map((event) => ({ ...event }));
+    } catch (error) {
+      diagnostics.log(
+        `Fallback public notes fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+        'warn'
+      );
+      return [];
+    }
+  }
+
+  async fetchUserRelayPreferences(
+    pubkey: string,
+    seedRelays: string[],
+    maxWaitMs: number = 6000
+  ): Promise<string[]> {
+    if (!pubkey || seedRelays.length === 0) {
+      return [];
+    }
+
+    const filter: Filter = {
+      kinds: [10002],
+      authors: [pubkey],
+      limit: 10,
+    };
+
+    try {
+      const events = await this.pool.querySync(seedRelays, filter as any, {
+        maxWait: maxWaitMs,
+        label: 'user-relay-preferences',
+      });
+
+      const latest = events.sort((a, b) => b.created_at - a.created_at)[0];
+      if (!latest) {
+        return [];
+      }
+
+      const relays = latest.tags
+        .filter((tag) => tag[0] === 'r' && typeof tag[1] === 'string')
+        .map((tag) => String(tag[1]).trim())
+        .filter((url) => url.startsWith('wss://'));
+
+      return Array.from(new Set(relays));
+    } catch (error) {
+      diagnostics.log(
+        `Failed to fetch user relay preferences: ${error instanceof Error ? error.message : String(error)}`,
+        'warn'
+      );
+      return [];
+    }
+  }
+
+  async fetchProfileMetadata(
+    pubkey: string,
+    relays: string[],
+    maxWaitMs: number = 6000
+  ): Promise<NostrProfileMetadata | null> {
+    if (!pubkey || relays.length === 0) {
+      return null;
+    }
+
+    const filter: Filter = {
+      kinds: [0],
+      authors: [pubkey],
+      limit: 5,
+    };
+
+    try {
+      const events = await this.pool.querySync(relays, filter as any, {
+        maxWait: maxWaitMs,
+        label: 'profile-metadata',
+      });
+
+      const latest = events.sort((a, b) => b.created_at - a.created_at)[0];
+      if (!latest || !latest.content) {
+        return null;
+      }
+
+      const parsed = JSON.parse(latest.content) as NostrProfileMetadata;
+      if (!parsed || typeof parsed !== 'object') {
+        return null;
+      }
+
+      return parsed;
+    } catch (error) {
+      diagnostics.log(
+        `Failed to fetch profile metadata: ${error instanceof Error ? error.message : String(error)}`,
+        'warn'
+      );
+      return null;
+    }
+  }
+
   unsubscribe(subId: string) {
     const unsub = this.subscriptions.get(subId);
     if (unsub) {
@@ -224,18 +336,31 @@ export class NostrClient {
 
   decodeNsec(nsec: string): { pubkey: string; privkey: string } {
     try {
-      const decoded = nip19.decode(nsec);
-      if (decoded.type !== 'nsec') {
-        throw new Error('Invalid nsec key');
+      const normalized = nsec.trim();
+      if (!normalized) {
+        throw new Error('nsec is empty');
       }
-      const privkeyData = decoded.data as Uint8Array;
+
+      const decoded = nip19.decode(normalized);
+      if (decoded.type !== 'nsec') {
+        throw new Error('Invalid key type (expected nsec)');
+      }
+
+      const privkeyData = decoded.data;
+      if (!(privkeyData instanceof Uint8Array)) {
+        throw new Error('Invalid nsec payload');
+      }
+
       const privkey = Array.from(privkeyData)
         .map(b => b.toString(16).padStart(2, '0'))
         .join('');
-      const pubkey = getPublicKey(privkey as any);
+
+      // nostr-tools v2 expects Uint8Array for secret key in modern APIs
+      const pubkey = getPublicKey(privkeyData as any);
       return { pubkey, privkey };
     } catch (error) {
-      throw new Error(`Failed to decode nsec: ${error instanceof Error ? error.message : ''}`);
+      const msg = error instanceof Error ? error.message : 'Unknown decode error';
+      throw new Error(`Failed to decode nsec. ${msg}`);
     }
   }
 

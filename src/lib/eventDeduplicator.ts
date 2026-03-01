@@ -1,22 +1,20 @@
-import { LRUCache } from 'lru-cache';
 import { diagnostics } from './diagnostics';
 
 /**
  * EventDeduplicator prevents duplicate events from appearing in the feed
  * when the same event is received from multiple relays.
- * 
- * Uses LRU cache with max 10,000 events to balance memory usage and effectiveness.
  */
 export class EventDeduplicator {
-  private seenEvents: LRUCache<string, boolean>;
+  private seenEvents: Map<string, number>;
   private duplicateCount: number = 0;
   private uniqueCount: number = 0;
+  private readonly maxSize: number;
+  private readonly ttlMs: number;
 
-  constructor(maxSize: number = 10000) {
-    this.seenEvents = new LRUCache<string, boolean>({
-      max: maxSize,
-      ttl: 1000 * 60 * 60 * 24, // 24 hours TTL
-    });
+  constructor(maxSize: number = 10000, ttlMs: number = 1000 * 60 * 60 * 24) {
+    this.maxSize = maxSize;
+    this.ttlMs = ttlMs;
+    this.seenEvents = new Map();
 
     diagnostics.log(`EventDeduplicator initialized with max size ${maxSize}`, 'info');
   }
@@ -27,9 +25,12 @@ export class EventDeduplicator {
    * @returns true if this is a duplicate, false if it's new
    */
   isDuplicate(eventId: string): boolean {
-    if (this.seenEvents.has(eventId)) {
+    const now = Date.now();
+    const existing = this.seenEvents.get(eventId);
+
+    if (existing && now - existing <= this.ttlMs) {
       this.duplicateCount++;
-      
+
       // Log duplicates periodically (every 10th)
       if (this.duplicateCount % 10 === 0) {
         diagnostics.log(
@@ -37,13 +38,18 @@ export class EventDeduplicator {
           'info'
         );
       }
-      
+
       return true;
     }
 
-    // Mark as seen
-    this.seenEvents.set(eventId, true);
+    // Expired or new entry: replace and move to MRU position.
+    this.seenEvents.delete(eventId);
+    this.seenEvents.set(eventId, now);
     this.uniqueCount++;
+
+    this.evictIfNeeded();
+    this.cleanupExpired(now);
+
     return false;
   }
 
@@ -65,17 +71,19 @@ export class EventDeduplicator {
       cacheSize: this.seenEvents.size,
       duplicatesFiltered: this.duplicateCount,
       uniqueEvents: this.uniqueCount,
-      filterRate: this.uniqueCount > 0 
-        ? (this.duplicateCount / (this.duplicateCount + this.uniqueCount) * 100).toFixed(1) + '%'
-        : '0%',
+      filterRate:
+        this.uniqueCount > 0
+          ? (this.duplicateCount / (this.duplicateCount + this.uniqueCount) * 100).toFixed(1) + '%'
+          : '0%',
     };
   }
 
   /**
-   * Check if cache contains an event
+   * Check if cache contains a non-expired event
    */
   has(eventId: string): boolean {
-    return this.seenEvents.has(eventId);
+    const ts = this.seenEvents.get(eventId);
+    return ts !== undefined && Date.now() - ts <= this.ttlMs;
   }
 
   /**
@@ -83,6 +91,24 @@ export class EventDeduplicator {
    */
   size(): number {
     return this.seenEvents.size;
+  }
+
+  private evictIfNeeded(): void {
+    while (this.seenEvents.size > this.maxSize) {
+      const oldestKey = this.seenEvents.keys().next().value;
+      if (!oldestKey) break;
+      this.seenEvents.delete(oldestKey);
+    }
+  }
+
+  private cleanupExpired(now: number): void {
+    // Opportunistic cleanup from oldest entries only.
+    for (const [id, ts] of this.seenEvents) {
+      if (now - ts <= this.ttlMs) {
+        break;
+      }
+      this.seenEvents.delete(id);
+    }
   }
 }
 

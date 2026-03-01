@@ -1,11 +1,14 @@
 {
   "name": "weedoshi",
   "version": "1.0.0",
+  "author": "Wondrej D. Grower & LLM's",
   "scripts": {
-    "dev": "expo start --clear",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "lint": "eslint .",
+    "dev": "HOME=. EXPO_NO_TELEMETRY=1 expo start --clear",
+    "android": "HOME=. EXPO_NO_TELEMETRY=1 expo start --android",
+    "ios": "HOME=. EXPO_NO_TELEMETRY=1 expo start --ios",
+    "build": "HOME=. EXPO_NO_TELEMETRY=1 expo export --platform web",
+    "preview": "python3 -m http.server 4173 --bind 127.0.0.1 --directory dist",
+    "lint": "test -x ./node_modules/.bin/eslint && ./node_modules/.bin/eslint -c .eslintrc.json . || (echo 'Install dependencies first: npm install' && exit 1)",
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
@@ -37,7 +40,11 @@
     "@types/node": "^20",
     "@types/react": "^18.3.1",
     "@types/react-native": "^0.73.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-native": "^5.0.0",
     "eslint": "^8.55.0",
+    "prettier": "^3.3.3",
     "tailwindcss": "^3.4.1",
     "typescript": "^5.3.3"
   },

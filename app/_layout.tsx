@@ -11,6 +11,8 @@ import { initializeStorage } from '../src/lib/storageInit';
 import { authManager } from '../src/lib/authManager';
 import { relayManager } from '../src/lib/relayManager';
 import { ErrorBoundary } from '../src/components/ErrorBoundary';
+import { getRuntimeMode } from '../src/runtime/mode';
+import { getFeatures } from '../src/runtime/features';
 
 SplashScreen.preventAutoHideAsync();
 
@@ -30,6 +32,9 @@ export default function RootLayout() {
       console.log('🔍 App: crypto.getRandomValues available:', 
         typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function' ? '✅ YES' : '🔴 NO'
       );
+      const runtimeMode = getRuntimeMode();
+      const runtimeFeatures = getFeatures(runtimeMode);
+      console.log(`🧭 Runtime self-check: mode=${runtimeMode}`, runtimeFeatures);
 
       // Timeout fallback - if init takes too long, proceed anyway
       const initTimeout = setTimeout(() => {

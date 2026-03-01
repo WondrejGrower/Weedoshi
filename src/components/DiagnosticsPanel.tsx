@@ -74,7 +74,9 @@ export function DiagnosticsPanel() {
               <Text style={styles.statLabel}>Errors</Text>
             </View>
             <View style={styles.statBox}>
-              <Text style={styles.statValue}>{relayStats.avgLatency}ms</Text>
+              <Text style={styles.statValue}>
+                {relayStats.avgLatency === null ? '—' : `${relayStats.avgLatency}ms`}
+              </Text>
               <Text style={styles.statLabel}>Avg Latency</Text>
             </View>
           </View>
@@ -93,7 +95,7 @@ export function DiagnosticsPanel() {
               </View>
               <View style={styles.relayStats}>
                 <Text style={styles.relayStatText}>
-                  Latency: {health.avgLatency}ms
+                  Latency: {health.avgLatency > 0 ? `${health.avgLatency}ms` : '—'}
                 </Text>
                 <Text style={styles.relayStatText}>
                   Events: {health.eventsReceived}
