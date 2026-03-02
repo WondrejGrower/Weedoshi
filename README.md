@@ -111,6 +111,44 @@ assets/
 - [SECURITY.md](SECURITY.md)
 - [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)
 
+## Roadmap
+
+### 1) Security & Signing
+
+- [x] Security baseline (log redaction + publish leak guard)
+- [x] Signer-first layer (NIP-07 ready, local signer fallback)
+- [ ] NIP-46 end-to-end session UX and recovery flows
+- [ ] Session persistence improvements for trusted-device mode
+
+### 2) Profile & Navigation
+
+- [x] Profile-first landing flow
+- [x] Bottom navigation (Feed / Profile / Growmies)
+- [x] Settings menu moved to gear button
+- [ ] Final responsive polish for tablet and desktop spacing
+
+### 3) Diary UX
+
+- [x] Diary tiles on profile with cover previews
+- [x] Dedicated diary detail page (`/diary/[id]`)
+- [x] Custom phase/week editing per entry
+- [x] Cover image selection in diary edit mode
+- [ ] Drag-and-drop entry ordering and richer timeline filters
+
+### 4) Feed & Discovery
+
+- [x] Default hashtag focus (`#weedstr` + `#plantstr`) with user override
+- [x] Feed filter toggles and custom hashtag input
+- [ ] Better author metadata hydration (display names, avatars, relay fallbacks)
+- [ ] Smarter media/link classification and preview reliability
+
+### 5) Growmies
+
+- [x] Growmies list and quick add actions
+- [x] Growmies-only feed mode
+- [ ] Growmies settings consolidation and relay sync hardening
+- [ ] Follow graph import/export for account migration
+
 ## License
 
 MIT

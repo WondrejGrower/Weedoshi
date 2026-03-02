@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { useRouter } from 'expo-router';
 import {
   View,
   Text,
@@ -33,17 +34,14 @@ import {
   diaryManager,
   defaultDiaryId,
   fetchAuthorNotes,
-  fetchEventsByIds,
-  type DiaryEntry,
   type DiaryIndex,
 } from '../src/lib/diaryManager';
-import { diaryStore } from '../src/lib/diaryStore';
+import { diaryStore, type Diary } from '../src/lib/diaryStore';
 import { growmiesStore } from '../src/lib/growmiesStore';
 import { DEFAULT_HASHTAGS } from '../src/features/home/constants';
 import {
   getAvatarLabel,
   getDisplayName,
-  groupDiaryEntries,
   shortPubkey,
 } from '../src/features/home/profileHelpers';
 import { useFeedController } from '../src/features/feed/useFeedController';
@@ -51,6 +49,7 @@ import { logger } from '../src/lib/logger';
 import { assertNoSensitiveMaterial } from '../src/lib/securityBaseline';
 import { getAllHashtags } from '../src/lib/eventFilter';
 import { getJson, setJson } from '../src/lib/persistentStorage';
+import { extractMediaFromContent } from '../src/lib/mediaExtraction';
 
 const runtimeMode = getRuntimeMode();
 const features = getFeatures(runtimeMode);
@@ -60,39 +59,17 @@ type ProfileTab = 'diary' | 'all';
 type SettingsSection = 'authentication' | 'relays' | 'hashtags' | 'growmies';
 const LOGIN_PROMPT_DISMISSED_KEY = 'login_prompt_dismissed_v1';
 const PHASE_TEMPLATE_OPTIONS = ['Seedling', 'Vegetation', 'Flowering', 'Harvest'];
-const PHASE_WEEK_SEPARATOR = ' :: ';
 
-function parsePhaseWeek(value: string): { phase: string; week: string } {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return { phase: '', week: '' };
+function getDiaryCoverForCard(diary: Diary): string | undefined {
+  if (diary.coverImage) return diary.coverImage;
+  for (const item of diary.items) {
+    if (item.image) return item.image;
+    if (item.contentPreview) {
+      const fromPreview = extractMediaFromContent(item.contentPreview).images[0];
+      if (fromPreview) return fromPreview;
+    }
   }
-  if (trimmed.includes(PHASE_WEEK_SEPARATOR)) {
-    const [phasePart, ...rest] = trimmed.split(PHASE_WEEK_SEPARATOR);
-    return {
-      phase: phasePart.trim(),
-      week: rest.join(PHASE_WEEK_SEPARATOR).trim(),
-    };
-  }
-  const weekMatch = trimmed.match(/^(.*?)[\s-]*week\s*([0-9a-zA-Z-]+)$/i);
-  if (weekMatch) {
-    return {
-      phase: weekMatch[1].trim(),
-      week: weekMatch[2].trim(),
-    };
-  }
-  return { phase: trimmed, week: '' };
-}
-
-function composePhaseWeek(phaseValue: string, weekValue: string): string {
-  const phase = phaseValue.trim();
-  const week = weekValue.trim();
-  if (phase && week) {
-    return `${phase}${PHASE_WEEK_SEPARATOR}${week}`;
-  }
-  if (phase) return phase;
-  if (week) return `Week ${week}`;
-  return 'General';
+  return undefined;
 }
 
 type DiaryRunOption = {
@@ -104,6 +81,7 @@ type DiaryRunOption = {
 };
 
 export default function HomeScreen() {
+  const router = useRouter();
   const { width } = useWindowDimensions();
   const isMobile = width < 700;
   const [activePage, setActivePage] = useState<MainPage>('profile');
@@ -144,7 +122,6 @@ export default function HomeScreen() {
   const [diaryIdInput, setDiaryIdInput] = useState(defaultDiaryId());
   const [diaryTitleInput, setDiaryTitleInput] = useState('My Grow Run #1');
   const [diaryDraft, setDiaryDraft] = useState<DiaryIndex | null>(null);
-  const [diaryEvents, setDiaryEvents] = useState<Record<string, NostrRawEvent>>({});
   const [diaryLoading, setDiaryLoading] = useState(false);
   const [diaryPublishing, setDiaryPublishing] = useState(false);
   const [diaryEditMode, setDiaryEditMode] = useState(false);
@@ -259,7 +236,6 @@ export default function HomeScreen() {
 
     if (!selectedId) {
       setDiaryDraft(null);
-      setDiaryEvents({});
       setDiaryIdInput(defaultDiaryId());
       setDiaryTitleInput('My Grow Run #1');
       setDiaryPlantInput('');
@@ -290,31 +266,6 @@ export default function HomeScreen() {
     setDiaryPlantInput(selected.plant || '');
     setDiaryPhaseInput(selected.phase || '');
 
-    const localEventFallbacks: Record<string, NostrRawEvent> = {};
-    for (const item of selected.items) {
-      localEventFallbacks[item.eventId] = {
-        id: item.eventId,
-        pubkey: item.authorPubkey,
-        created_at: item.createdAt,
-        kind: 1,
-        tags: [],
-        content: item.contentPreview || '',
-        sig: '',
-      };
-    }
-    setDiaryEvents(localEventFallbacks);
-
-    const ids = selected.items.map((item) => item.eventId);
-    if (ids.length > 0 && relayUrls.length > 0) {
-      const byId = await fetchEventsByIds(diaryManager.getPool(), relayUrls, ids);
-      if (byId.size > 0) {
-        const fetched: Record<string, NostrRawEvent> = { ...localEventFallbacks };
-        byId.forEach((event, id) => {
-          fetched[id] = event;
-        });
-        setDiaryEvents(fetched);
-      }
-    }
   }, [relayUrls]);
 
   const hydrateGrowmiesState = useCallback(() => {
@@ -395,7 +346,6 @@ export default function HomeScreen() {
   useEffect(() => {
     if (!authState.isLoggedIn || !authState.pubkey) {
       setDiaryDraft(null);
-      setDiaryEvents({});
       setProfilePosts([]);
       setRunOptions([]);
       setDiaryEditMode(false);
@@ -467,6 +417,7 @@ export default function HomeScreen() {
 
     try {
       let targetId = addToDiaryTargetId;
+      const eventIdToOpen = addToDiaryEvent.id;
       if (!targetId && newDiaryInlineTitle.trim()) {
         assertNoSensitiveMaterial(newDiaryInlineTitle.trim(), 'new diary title');
         const created = await diaryStore.createDiary(newDiaryInlineTitle.trim(), false);
@@ -483,6 +434,10 @@ export default function HomeScreen() {
       setAddToDiaryModalOpen(false);
       setAddToDiaryEvent(null);
       setError(null);
+      router.push({
+        pathname: '/diary/[id]' as any,
+        params: { id: targetId, entryId: eventIdToOpen } as any,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add post to diary');
     }
@@ -499,47 +454,6 @@ export default function HomeScreen() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add Growmie');
     }
-  };
-
-  const moveDiaryEntry = (index: number, direction: 'up' | 'down') => {
-    if (!diaryDraft) return;
-    const target = direction === 'up' ? index - 1 : index + 1;
-    if (target < 0 || target >= diaryDraft.entries.length) return;
-
-    const nextEntries = [...diaryDraft.entries];
-    const temp = nextEntries[index];
-    nextEntries[index] = nextEntries[target];
-    nextEntries[target] = temp;
-
-    const nextDraft: DiaryIndex = {
-      ...diaryDraft,
-      entries: nextEntries,
-    };
-    setDiaryDraft(nextDraft);
-  };
-
-  const removeDiaryEntry = async (entryId: string) => {
-    if (!diaryDraft) return;
-    await diaryStore.removeItemFromDiary(diaryDraft.diaryId, entryId);
-    await hydrateDiaryStateFromStore(diaryDraft.diaryId);
-  };
-
-  const updateEntryChapter = (entryId: string, nextChapter: string) => {
-    if (!diaryDraft) return;
-
-    const nextDraft: DiaryIndex = {
-      ...diaryDraft,
-      chapters: [],
-      entries: diaryDraft.entries.map((entry) =>
-        entry.id === entryId
-          ? {
-              ...entry,
-              chapter: nextChapter.trim() || 'General',
-            }
-          : entry
-      ),
-    };
-    setDiaryDraft(nextDraft);
   };
 
   const handlePublishDiaryChanges = async () => {
@@ -577,12 +491,6 @@ export default function HomeScreen() {
     }
   };
 
-  const handleStartEdit = () => {
-    if (!diaryDraft) return;
-    setDiarySnapshot(JSON.parse(JSON.stringify(diaryDraft)) as DiaryIndex);
-    setDiaryEditMode(true);
-  };
-
   const handleCancelEdit = () => {
     if (diarySnapshot) {
       setDiaryDraft(diarySnapshot);
@@ -602,22 +510,12 @@ export default function HomeScreen() {
       phase: diaryPhaseInput,
     });
     await hydrateDiaryStateFromStore(created.id);
-    setDiaryEditMode(true);
-    const selected = diaryStore.getDiary(created.id);
-    if (selected) {
-      setDiarySnapshot(
-        JSON.parse(
-          JSON.stringify({
-            version: 1,
-            diaryId: selected.id,
-            title: selected.title,
-            defaultRelayHints: relayUrls,
-            chapters: [],
-            entries: [],
-          })
-        ) as DiaryIndex
-      );
-    }
+    setDiaryEditMode(false);
+    setDiarySnapshot(null);
+    router.push({
+      pathname: '/diary/[id]' as any,
+      params: { id: created.id } as any,
+    });
   };
 
   const handleOpenDiaryEditor = async () => {
@@ -629,9 +527,10 @@ export default function HomeScreen() {
       await handleCreateDiary();
       return;
     }
-    if (!diaryEditMode) {
-      handleStartEdit();
-    }
+    router.push({
+      pathname: '/diary/[id]' as any,
+      params: { id: diaryDraft.diaryId } as any,
+    });
   };
 
   const handleSelectRun = (run: DiaryRunOption) => {
@@ -862,19 +761,13 @@ export default function HomeScreen() {
     refreshFeed();
   }, [feedFilterEnabled, feedHashtagsKey, refreshFeed, relayUrls.length]);
 
-  const groupedDiary = useMemo(() => groupDiaryEntries(diaryDraft), [diaryDraft]);
-  const selectedDiary = useMemo(
-    () => (diaryDraft ? diaryStore.getDiary(diaryDraft.diaryId) : null),
-    [diaryDraft]
+  const profileDiaries = useMemo(
+    () =>
+      runOptions
+        .map((run) => diaryStore.getDiary(run.diaryId))
+        .filter((diary): diary is Diary => Boolean(diary)),
+    [runOptions]
   );
-  const diaryItemById = useMemo(
-    () => new Map((selectedDiary?.items || []).map((item) => [item.eventId, item])),
-    [selectedDiary]
-  );
-  const selectedDiaryCoverImage = useMemo(() => {
-    if (selectedDiary?.coverImage) return selectedDiary.coverImage;
-    return selectedDiary?.items.find((item) => !!item.image)?.image;
-  }, [selectedDiary]);
   const nostrSinceLabel = useMemo(() => {
     if (!authState.pubkey) return 'Unknown';
     const timestamps = profilePosts.map((post) => post.created_at).filter((v) => Number.isFinite(v) && v > 0);
@@ -892,9 +785,7 @@ export default function HomeScreen() {
 
   const selectedRunSyncStatus =
     runOptions.find((run) => run.diaryId === diaryIdInput)?.syncStatus || 'local-only';
-  const profilePubkeyText = authState.pubkey
-    ? authState.pubkey.match(/.{1,16}/g)?.join('\n') || authState.pubkey
-    : shortPubkey(authState.pubkey);
+  const profilePubkeyText = shortPubkey(authState.pubkey);
   const nip46PhaseLabel = nip46PairingState.phase.toUpperCase();
   const isReadOnlyBlocked = authState.isLoggedIn && authState.isReadOnly;
   const readOnlyBlockHint = isReadOnlyBlocked
@@ -1110,6 +1001,13 @@ export default function HomeScreen() {
         showsVerticalScrollIndicator={false}
       >
         <View style={[styles.pageInner, isMobile && styles.pageInnerMobile]}>
+        <View style={[styles.brandPlaqueInline, isMobile && styles.brandPlaqueInlineMobile]}>
+          <Image
+            source={require('../assets/WeedoshiBanner.png')}
+            style={styles.brandPlaqueImage}
+            resizeMode="cover"
+          />
+        </View>
         {!authState.isLoggedIn && (
           <View style={styles.infoBox}>
             <Text style={styles.infoText}>Use the green Login button to connect Alby, or continue as anon.</Text>
@@ -1121,7 +1019,7 @@ export default function HomeScreen() {
             {profileMetadata?.banner ? (
               <Image source={{ uri: profileMetadata.banner }} style={styles.profileBannerImage} resizeMode="cover" />
             ) : (
-              <View style={styles.profileBannerFallback} />
+              <Image source={require('../assets/WeedoshiBanner.png')} style={styles.profileBannerImage} resizeMode="cover" />
             )}
             <View pointerEvents="none" style={styles.profileBannerOverlayTop} />
             <View pointerEvents="none" style={styles.profileBannerOverlayBottom} />
@@ -1147,7 +1045,9 @@ export default function HomeScreen() {
               </TouchableOpacity>
               <View style={styles.profileMeta}>
                 <View style={styles.profileNameRow}>
-                  <Text style={styles.profileName}>{getDisplayName(authState, profileMetadata)}</Text>
+                  <Text style={[styles.profileName, isMobile && styles.profileNameMobile]}>
+                    {getDisplayName(authState, profileMetadata)}
+                  </Text>
                 </View>
                 <Text style={styles.profilePubkey}>{profilePubkeyText}</Text>
                 {profileMetadata?.about ? (
@@ -1175,24 +1075,6 @@ export default function HomeScreen() {
                 </View>
               </View>
             </View>
-
-            {selectedDiary && (
-              <View style={styles.diaryCoverHero}>
-                {selectedDiaryCoverImage ? (
-                  <Image source={{ uri: selectedDiaryCoverImage }} style={styles.diaryCoverHeroImage} resizeMode="cover" />
-                ) : (
-                  <View style={styles.diaryCoverHeroFallback}>
-                    <Text style={styles.diaryCoverHeroFallbackText}>No cover image</Text>
-                  </View>
-                )}
-                <View style={styles.diaryCoverHeroMeta}>
-                  <Text style={styles.diaryCoverHeroTitle}>{selectedDiary.title}</Text>
-                  <Text style={styles.diaryCoverHeroSubtitle}>
-                    {(selectedDiary.plant || 'Plant not set')} • {(selectedDiary.phase || 'Phase not set')}
-                  </Text>
-                </View>
-              </View>
-            )}
 
             <View style={styles.diaryHeaderActions}>
               <TouchableOpacity
@@ -1374,7 +1256,7 @@ export default function HomeScreen() {
               </View>
             )}
 
-            {!diaryLoading && (!diaryDraft || diaryDraft.entries.length === 0) && (
+            {!diaryLoading && profileDiaries.length === 0 && (
               <View style={styles.emptyDiaryState}>
                 <Text style={styles.emptyDiaryTitle}>Start your grow diary</Text>
                 <Text style={styles.emptyDiarySubtitle}>
@@ -1394,34 +1276,37 @@ export default function HomeScreen() {
               </View>
             )}
 
-            {!!diaryDraft && diaryDraft.entries.length > 0 && !diaryEditMode && (
+            {profileDiaries.length > 0 && (
               <View style={styles.diaryTilesGrid}>
-                {diaryDraft.entries.map((entry) => {
-                  const note = diaryEvents[entry.id];
-                  const parsedPhaseWeek = parsePhaseWeek(entry.chapter);
-                  const item = diaryItemById.get(entry.id);
-                  const imageUri = item?.image;
-                  const isCoverTile = Boolean(imageUri && selectedDiaryCoverImage && imageUri === selectedDiaryCoverImage);
+                {profileDiaries.map((diary) => {
+                  const imageUri = getDiaryCoverForCard(diary);
+                  const updatedAtTs = diary.updatedAt || diary.createdAt;
 
                   return (
                     <Pressable
-                      key={entry.id}
+                      key={diary.id}
                       style={({ hovered, pressed }) => [
                         styles.diaryTileCard,
                         !isMobile && styles.diaryTileCardDesktop,
                         isMobile && styles.diaryTileCardMobile,
                         (hovered || pressed) && styles.diaryTileCardHover,
                       ]}
+                      onPress={() => {
+                        router.push({
+                          pathname: '/diary/[id]' as any,
+                          params: { id: diary.id } as any,
+                        });
+                      }}
                     >
                       {imageUri ? (
                         <View style={styles.diaryTileImageWrap}>
                           <Image source={{ uri: imageUri }} style={styles.diaryTileImage} resizeMode="cover" />
                           <View pointerEvents="none" style={styles.diaryTileImageShade} />
-                          {isCoverTile && (
+                          {diary.coverImage ? (
                             <View style={styles.diaryTileCoverBadge}>
                               <Text style={styles.diaryTileCoverBadgeText}>Cover</Text>
                             </View>
-                          )}
+                          ) : null}
                         </View>
                       ) : (
                         <View style={styles.diaryTileImageFallback}>
@@ -1429,169 +1314,17 @@ export default function HomeScreen() {
                         </View>
                       )}
                       <View style={styles.diaryTileMeta}>
-                        <Text style={styles.diaryTileTitle}>{parsedPhaseWeek.phase || 'General'}</Text>
+                        <Text style={styles.diaryTileTitle}>{diary.title || 'Untitled diary'}</Text>
                         <Text style={styles.diaryTileSub}>
-                          {parsedPhaseWeek.week ? `Week ${parsedPhaseWeek.week}` : 'Week n/a'}
+                          {(diary.plant || 'Plant n/a')} • {(diary.phase || 'Phase n/a')}
                         </Text>
                         <Text style={styles.diaryTileDate}>
-                          {new Date((note?.created_at || entry.addedAt) * 1000).toLocaleDateString()}
+                          {diary.items.length} entries • {new Date(updatedAtTs * 1000).toLocaleDateString()}
                         </Text>
                       </View>
                     </Pressable>
                   );
                 })}
-              </View>
-            )}
-
-            {!!diaryDraft && diaryDraft.entries.length > 0 && diaryEditMode && (
-              <View>
-                {groupedDiary.map((section) => (
-                  <View key={section.chapter} style={styles.chapterSection}>
-                    <Text style={styles.chapterTitle}>{section.label}</Text>
-                    <View style={styles.chapterDivider} />
-
-                    {section.entries.map((entry: DiaryEntry) => {
-                      const note = diaryEvents[entry.id];
-                      const absoluteIndex = diaryDraft
-                        ? diaryDraft.entries.findIndex((candidate) => candidate.id === entry.id)
-                        : -1;
-                      const parsedPhaseWeek = parsePhaseWeek(entry.chapter);
-                      const item = diaryItemById.get(entry.id);
-                      const imageUri = item?.image;
-                      const isCoverTile = Boolean(imageUri && selectedDiaryCoverImage && imageUri === selectedDiaryCoverImage);
-
-                      return (
-                        <View key={entry.id} style={styles.diaryCard}>
-                          <View style={styles.diaryCardHeader}>
-                            <Text style={styles.diaryCardDate}>
-                              {new Date((note?.created_at || entry.addedAt) * 1000).toLocaleDateString()}
-                            </Text>
-                            <TouchableOpacity>
-                              <Text style={styles.diaryCardMenu}>⋯</Text>
-                            </TouchableOpacity>
-                          </View>
-
-                          {note ? (
-                            <PostMediaRenderer content={note.content} tags={note.tags} textNumberOfLines={4} />
-                          ) : (
-                            <Text style={styles.diaryCardText}>Post not found on current relays.</Text>
-                          )}
-
-                          <View style={styles.diaryEditRow}>
-                            <TouchableOpacity
-                              style={styles.iconButton}
-                              onPress={() => {
-                                if (absoluteIndex >= 0) moveDiaryEntry(absoluteIndex, 'up');
-                              }}
-                            >
-                              <Text style={styles.iconButtonText}>↑</Text>
-                            </TouchableOpacity>
-                            <TouchableOpacity
-                              style={styles.iconButton}
-                              onPress={() => {
-                                if (absoluteIndex >= 0) moveDiaryEntry(absoluteIndex, 'down');
-                              }}
-                            >
-                              <Text style={styles.iconButtonText}>↓</Text>
-                            </TouchableOpacity>
-                            <View style={styles.entryPhaseInlineWrap}>
-                              <Text style={styles.entryPhaseInlineLabel}>Phase / Week</Text>
-                              <View style={styles.entryPhaseSplitRow}>
-                                <TextInput
-                                  style={[styles.entryPhaseInlineInput, styles.entryPhaseInlineInputHalf]}
-                                  value={parsedPhaseWeek.phase}
-                                  onChangeText={(value) =>
-                                    updateEntryChapter(entry.id, composePhaseWeek(value, parsedPhaseWeek.week))
-                                  }
-                                  onBlur={() => {
-                                    if (!diaryDraft) return;
-                                    diaryStore
-                                      .setDiaryItemPhaseLabels(diaryDraft.diaryId, { [entry.id]: entry.chapter })
-                                      .catch((err) =>
-                                        setError(err instanceof Error ? err.message : 'Failed to save entry phase')
-                                      );
-                                  }}
-                                  placeholder="Phase"
-                                  placeholderTextColor="#9ca3af"
-                                />
-                                <TextInput
-                                  style={[styles.entryPhaseInlineInput, styles.entryPhaseInlineInputWeek]}
-                                  value={parsedPhaseWeek.week}
-                                  onChangeText={(value) =>
-                                    updateEntryChapter(entry.id, composePhaseWeek(parsedPhaseWeek.phase, value))
-                                  }
-                                  onBlur={() => {
-                                    if (!diaryDraft) return;
-                                    diaryStore
-                                      .setDiaryItemPhaseLabels(diaryDraft.diaryId, { [entry.id]: entry.chapter })
-                                      .catch((err) =>
-                                        setError(err instanceof Error ? err.message : 'Failed to save entry week')
-                                      );
-                                  }}
-                                  placeholder="Week"
-                                  placeholderTextColor="#9ca3af"
-                                />
-                              </View>
-                              <View style={styles.entryPhaseTemplatesRow}>
-                                {PHASE_TEMPLATE_OPTIONS.map((template) => (
-                                  <TouchableOpacity
-                                    key={`${entry.id}-${template}`}
-                                    style={[
-                                      styles.entryPhaseTemplateChip,
-                                      parsedPhaseWeek.phase.toLowerCase().startsWith(template.toLowerCase()) &&
-                                        styles.entryPhaseTemplateChipActive,
-                                    ]}
-                                    onPress={() => {
-                                      updateEntryChapter(entry.id, composePhaseWeek(template, parsedPhaseWeek.week));
-                                      if (!diaryDraft) return;
-                                      diaryStore
-                                        .setDiaryItemPhaseLabels(diaryDraft.diaryId, {
-                                          [entry.id]: composePhaseWeek(template, parsedPhaseWeek.week),
-                                        })
-                                        .catch((err) =>
-                                          setError(err instanceof Error ? err.message : 'Failed to save entry phase')
-                                        );
-                                    }}
-                                  >
-                                    <Text
-                                      style={[
-                                        styles.entryPhaseTemplateChipText,
-                                        parsedPhaseWeek.phase.toLowerCase().startsWith(template.toLowerCase()) &&
-                                          styles.entryPhaseTemplateChipTextActive,
-                                      ]}
-                                    >
-                                      {template}
-                                    </Text>
-                                  </TouchableOpacity>
-                                ))}
-                              </View>
-                            </View>
-                            {imageUri && diaryDraft && (
-                              <TouchableOpacity
-                                style={[styles.coverPickButton, isCoverTile && styles.coverPickButtonActive]}
-                                onPress={() => {
-                                  diaryStore
-                                    .setDiaryCoverImage(diaryDraft.diaryId, imageUri)
-                                    .then(() => hydrateDiaryStateFromStore(diaryDraft.diaryId))
-                                    .catch((err) =>
-                                      setError(err instanceof Error ? err.message : 'Failed to set diary cover')
-                                    );
-                                }}
-                              >
-                                <Text style={[styles.coverPickButtonText, isCoverTile && styles.coverPickButtonTextActive]}>
-                                  {isCoverTile ? 'Cover set' : 'Set cover'}
-                                </Text>
-                              </TouchableOpacity>
-                            )}
-                            <TouchableOpacity style={styles.iconDangerButton} onPress={() => removeDiaryEntry(entry.id)}>
-                              <Text style={styles.iconDangerText}>✕</Text>
-                            </TouchableOpacity>
-                          </View>
-                        </View>
-                      );
-                    })}
-                  </View>
-                ))}
               </View>
             )}
           </View>
@@ -2411,6 +2144,7 @@ export default function HomeScreen() {
           </View>
         </View>
       </Modal>
+
     </SafeAreaView>
   );
 }
@@ -2418,7 +2152,7 @@ export default function HomeScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f9fafb',
+    backgroundColor: '#f2f1eb',
   },
   pageContainer: {
     flex: 1,
@@ -2442,15 +2176,17 @@ const styles = StyleSheet.create({
     paddingBottom: 88,
   },
   panel: {
-    backgroundColor: '#fff',
+    backgroundColor: '#fffdf8',
     borderRadius: 12,
     padding: 14,
     marginBottom: 14,
+    borderWidth: 1,
+    borderColor: '#e2d5b8',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.06,
-    shadowRadius: 4,
-    elevation: 1,
+    shadowOpacity: 0.07,
+    shadowRadius: 6,
+    elevation: 2,
   },
   panelTitle: {
     fontSize: 16,
@@ -2486,12 +2222,12 @@ const styles = StyleSheet.create({
     color: '#9ca3af',
   },
   feedItem: {
-    backgroundColor: '#fff',
+    backgroundColor: '#fffefb',
     borderRadius: 12,
     padding: 16,
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: '#ecf0ee',
+    borderColor: '#e2d7c0',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.04,
@@ -2508,14 +2244,14 @@ const styles = StyleSheet.create({
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: '#d1fae5',
+    backgroundColor: '#e2f0df',
     alignItems: 'center',
     justifyContent: 'center',
   },
   feedAuthorAvatarText: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#065f46',
+    color: '#1f5d35',
   },
   feedAuthorMeta: {
     flex: 1,
@@ -2524,7 +2260,7 @@ const styles = StyleSheet.create({
   author: {
     fontSize: 13,
     fontWeight: '600',
-    color: '#065f46',
+    color: '#1f5d35',
     lineHeight: 16,
   },
   timestamp: {
@@ -2540,27 +2276,27 @@ const styles = StyleSheet.create({
   },
   tag: {
     fontSize: 12,
-    color: '#047857',
+    color: '#1f5d35',
     fontWeight: '600',
-    backgroundColor: '#ecfdf5',
+    backgroundColor: '#ecf2e6',
     borderRadius: 999,
     paddingHorizontal: 8,
     paddingVertical: 3,
   },
   profileHeaderCard: {
-    backgroundColor: '#fff',
+    backgroundColor: '#fffdf8',
     borderRadius: 14,
     paddingBottom: 16,
     marginBottom: 12,
     marginTop: 8,
     borderWidth: 1,
-    borderColor: '#e5e7eb',
+    borderColor: '#e1d1ae',
     overflow: 'hidden',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.05,
-    shadowRadius: 24,
-    elevation: 2,
+    shadowOpacity: 0.08,
+    shadowRadius: 18,
+    elevation: 3,
   },
   profileHeaderCardMobile: {
     marginTop: 6,
@@ -2568,29 +2304,22 @@ const styles = StyleSheet.create({
   },
   profileBannerWrap: {
     width: '100%',
-    height: 252,
+    height: 268,
     overflow: 'hidden',
     borderTopLeftRadius: 14,
     borderTopRightRadius: 14,
   },
   profileBannerWrapMobile: {
-    height: 196,
+    height: 206,
   },
   profileBannerImage: {
     width: '100%',
     height: '100%',
     backgroundColor: '#d1d5db',
   },
-  profileBannerFallback: {
-    width: '100%',
-    height: '100%',
-    backgroundColor: '#ecfdf5',
-    borderBottomWidth: 1,
-    borderBottomColor: '#d1fae5',
-  },
   profileBannerOverlayTop: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.3)',
+    backgroundColor: 'rgba(0,0,0,0.22)',
   },
   profileBannerOverlayBottom: {
     position: 'absolute',
@@ -2598,48 +2327,63 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
     height: '60%',
-    backgroundColor: 'rgba(0,0,0,0.6)',
+    backgroundColor: 'rgba(0,0,0,0.42)',
   },
   profileHeaderContent: {
-    marginTop: -38,
+    marginTop: -42,
     paddingHorizontal: 16,
-    paddingTop: 10,
+    paddingTop: 0,
   },
   profileHeaderContentMobile: {
-    marginTop: -24,
+    marginTop: -30,
     paddingHorizontal: 12,
+  },
+  brandPlaqueInline: {
+    alignSelf: 'flex-start',
+    marginLeft: 2,
+    marginBottom: 8,
+    borderRadius: 18,
+    overflow: 'hidden',
+  },
+  brandPlaqueInlineMobile: {
+    marginLeft: 8,
+  },
+  brandPlaqueImage: {
+    width: 376,
+    height: 172,
+    borderRadius: 18,
+    opacity: 0.88,
   },
   profileHeaderRow: {
     flexDirection: 'row',
-    alignItems: 'flex-end',
+    alignItems: 'flex-start',
     gap: 14,
-    marginBottom: 10,
+    marginBottom: 14,
   },
   profileHeaderRowMobile: {
     gap: 10,
+    marginBottom: 12,
   },
   avatarCircle: {
-    width: 88,
-    height: 88,
-    borderRadius: 44,
+    width: 96,
+    height: 96,
+    borderRadius: 48,
     backgroundColor: '#d1fae5',
     alignItems: 'center',
     justifyContent: 'center',
     overflow: 'hidden',
     borderWidth: 4,
-    borderColor: '#fff',
-    transform: [{ translateY: -35 }],
+    borderColor: '#fffef9',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.25,
-    shadowRadius: 16,
+    shadowOpacity: 0.22,
+    shadowRadius: 14,
     elevation: 8,
   },
   avatarCircleMobile: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
-    transform: [{ translateY: -28 }],
+    width: 78,
+    height: 78,
+    borderRadius: 39,
   },
   avatarLabel: {
     fontSize: 24,
@@ -2647,18 +2391,24 @@ const styles = StyleSheet.create({
     color: '#047857',
   },
   avatarImage: {
-    width: 88,
-    height: 88,
-    borderRadius: 44,
+    width: 96,
+    height: 96,
+    borderRadius: 48,
   },
   avatarImageMobile: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
+    width: 78,
+    height: 78,
+    borderRadius: 39,
   },
   profileMeta: {
     flex: 1,
-    paddingTop: 16,
+    paddingTop: 10,
+    backgroundColor: '#fffdf7',
+    borderWidth: 1,
+    borderColor: '#dfcfa9',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingBottom: 10,
   },
   profileNameRow: {
     flexDirection: 'row',
@@ -2667,24 +2417,27 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   profileName: {
-    fontSize: 25,
+    fontSize: 38,
     fontWeight: '700',
-    color: '#111111',
+    color: '#1b4d2f',
     flexShrink: 1,
   },
+  profileNameMobile: {
+    fontSize: 30,
+  },
   profilePubkey: {
-    fontSize: 12,
-    color: '#6b7280',
-    opacity: 0.6,
+    fontSize: 11,
+    color: '#947848',
+    opacity: 0.9,
     marginTop: 4,
     fontFamily: 'monospace',
     flexShrink: 1,
   },
   profileBio: {
-    fontSize: 15,
-    lineHeight: 24,
-    color: '#444444',
-    marginTop: 16,
+    fontSize: 16,
+    lineHeight: 26,
+    color: '#304335',
+    marginTop: 14,
   },
   profileStatsRow: {
     flexDirection: 'row',
@@ -2694,8 +2447,8 @@ const styles = StyleSheet.create({
   },
   profileStatPill: {
     borderWidth: 1,
-    borderColor: '#d1fae5',
-    backgroundColor: '#f0fdf4',
+    borderColor: '#d7be86',
+    backgroundColor: '#fbf7ee',
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 6,
@@ -2704,53 +2457,13 @@ const styles = StyleSheet.create({
   profileStatValue: {
     fontSize: 13,
     fontWeight: '700',
-    color: '#14532d',
+    color: '#2a6a3c',
   },
   profileStatLabel: {
     fontSize: 10,
     fontWeight: '600',
-    color: '#166534',
+    color: '#967a47',
     marginTop: 2,
-  },
-  diaryCoverHero: {
-    marginHorizontal: 16,
-    marginBottom: 10,
-    borderRadius: 12,
-    overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: '#d1fae5',
-    backgroundColor: '#ecfdf5',
-  },
-  diaryCoverHeroImage: {
-    width: '100%',
-    height: 164,
-    backgroundColor: '#d1d5db',
-  },
-  diaryCoverHeroFallback: {
-    width: '100%',
-    height: 120,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#f3f4f6',
-  },
-  diaryCoverHeroFallbackText: {
-    fontSize: 12,
-    color: '#6b7280',
-    fontWeight: '600',
-  },
-  diaryCoverHeroMeta: {
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  diaryCoverHeroTitle: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: '#14532d',
-  },
-  diaryCoverHeroSubtitle: {
-    marginTop: 3,
-    fontSize: 12,
-    color: '#166534',
   },
   diaryHeaderActions: {
     flexDirection: 'row',
@@ -2902,7 +2615,7 @@ const styles = StyleSheet.create({
     marginRight: 0,
   },
   profileTabActive: {
-    backgroundColor: '#ecfdf5',
+    backgroundColor: '#edf2e8',
   },
   profileTabHover: {
     backgroundColor: '#f3f4f6',
@@ -2913,7 +2626,7 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
   profileTabTextActive: {
-    color: '#065f46',
+    color: '#235a37',
     fontWeight: '600',
   },
   profileTabUnderline: {
@@ -2923,16 +2636,16 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
   },
   profileTabUnderlineActive: {
-    backgroundColor: '#059669',
+    backgroundColor: '#b38a3f',
   },
   emptyDiaryState: {
-    backgroundColor: '#fff',
+    backgroundColor: '#fffdf9',
     borderRadius: 12,
     padding: 24,
     alignItems: 'center',
     marginBottom: 14,
     borderWidth: 1,
-    borderColor: '#e5e7eb',
+    borderColor: '#e2d6be',
   },
   emptyDiaryTitle: {
     fontSize: 22,
@@ -2965,12 +2678,12 @@ const styles = StyleSheet.create({
     backgroundColor: '#e5e7eb',
   },
   diaryCard: {
-    backgroundColor: '#fff',
+    backgroundColor: '#fffefb',
     borderRadius: 12,
     padding: 16,
     marginBottom: 9,
     borderWidth: 1,
-    borderColor: '#ecf0ee',
+    borderColor: '#e2d7c2',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.05,
@@ -3005,10 +2718,10 @@ const styles = StyleSheet.create({
     marginBottom: 14,
   },
   diaryTileCard: {
-    backgroundColor: '#fff',
+    backgroundColor: '#fffefb',
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#e5e7eb',
+    borderColor: '#e1d5bc',
     overflow: 'hidden',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
@@ -3083,7 +2796,7 @@ const styles = StyleSheet.create({
   diaryTileSub: {
     marginTop: 2,
     fontSize: 11,
-    color: '#047857',
+    color: '#2b6a3c',
     fontWeight: '600',
   },
   diaryTileDate: {
@@ -3102,8 +2815,8 @@ const styles = StyleSheet.create({
     height: 30,
     borderRadius: 6,
     borderWidth: 1,
-    borderColor: '#d1d5db',
-    backgroundColor: '#fff',
+    borderColor: '#d8ccb3',
+    backgroundColor: '#fffdf8',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -3128,9 +2841,9 @@ const styles = StyleSheet.create({
   },
   entryPhaseInlineInput: {
     borderWidth: 1,
-    borderColor: '#d1d5db',
+    borderColor: '#d8ccb4',
     borderRadius: 8,
-    backgroundColor: '#fff',
+    backgroundColor: '#fffdf8',
     paddingHorizontal: 9,
     paddingVertical: 6,
     fontSize: 12,
@@ -3154,16 +2867,16 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     borderRadius: 999,
     borderWidth: 1,
-    borderColor: '#d1fae5',
-    backgroundColor: '#ecfdf5',
+    borderColor: '#d9c592',
+    backgroundColor: '#f7f2e6',
   },
   entryPhaseTemplateChipActive: {
-    borderColor: '#059669',
-    backgroundColor: '#d1fae5',
+    borderColor: '#2f6b3f',
+    backgroundColor: '#e5efdf',
   },
   entryPhaseTemplateChipText: {
     fontSize: 10,
-    color: '#047857',
+    color: '#2f6b3f',
     fontWeight: '600',
   },
   entryPhaseTemplateChipTextActive: {
@@ -3186,8 +2899,8 @@ const styles = StyleSheet.create({
   },
   coverPickButton: {
     borderWidth: 1,
-    borderColor: '#86efac',
-    backgroundColor: '#f0fdf4',
+    borderColor: '#d4be8e',
+    backgroundColor: '#f8f4ea',
     borderRadius: 8,
     paddingHorizontal: 8,
     paddingVertical: 6,
@@ -3199,7 +2912,7 @@ const styles = StyleSheet.create({
   },
   coverPickButtonText: {
     fontSize: 11,
-    color: '#166534',
+    color: '#2f6b3f',
     fontWeight: '700',
   },
   coverPickButtonTextActive: {
@@ -3279,7 +2992,7 @@ const styles = StyleSheet.create({
   },
   input: {
     borderWidth: 1,
-    borderColor: '#d1d5db',
+    borderColor: '#dacdb3',
     borderRadius: 6,
     paddingHorizontal: 12,
     paddingVertical: 10,
@@ -3295,21 +3008,21 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   button: {
-    backgroundColor: '#059669',
+    backgroundColor: '#2f6b3f',
     borderRadius: 6,
     paddingVertical: 10,
     paddingHorizontal: 16,
     alignItems: 'center',
   },
   smallButton: {
-    backgroundColor: '#059669',
+    backgroundColor: '#2f6b3f',
     borderRadius: 8,
     paddingVertical: 8,
     paddingHorizontal: 12,
     alignItems: 'center',
   },
   buttonSecondary: {
-    backgroundColor: '#059669',
+    backgroundColor: '#2f6b3f',
     borderRadius: 6,
     paddingVertical: 8,
     paddingHorizontal: 12,
@@ -3322,13 +3035,13 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-start',
     borderRadius: 999,
     borderWidth: 1,
-    borderColor: '#a7f3d0',
-    backgroundColor: '#ecfdf5',
+    borderColor: '#d5bf8f',
+    backgroundColor: '#f7f2e7',
     paddingHorizontal: 10,
     paddingVertical: 6,
   },
   addToDiaryMiniText: {
-    color: '#047857',
+    color: '#2f6b3f',
     fontSize: 12,
     fontWeight: '600',
   },
@@ -3350,14 +3063,14 @@ const styles = StyleSheet.create({
     width: 24,
     height: 24,
     borderWidth: 2,
-    borderColor: '#059669',
+    borderColor: '#2f6b3f',
     borderRadius: 4,
     marginRight: 8,
     alignItems: 'center',
     justifyContent: 'center',
   },
   checkmark: {
-    color: '#059669',
+    color: '#2f6b3f',
     fontSize: 16,
     fontWeight: 'bold',
   },
@@ -3382,7 +3095,7 @@ const styles = StyleSheet.create({
   hashtagBadge: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#d1fae5',
+    backgroundColor: '#ebf2e5',
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 20,
@@ -3390,7 +3103,7 @@ const styles = StyleSheet.create({
   },
   hashtagText: {
     fontSize: 13,
-    color: '#059669',
+    color: '#2f6b3f',
     fontWeight: '500',
   },
   errorBoxGlobal: {
@@ -3442,9 +3155,9 @@ const styles = StyleSheet.create({
   },
   feedFilterCard: {
     borderWidth: 1,
-    borderColor: '#d1fae5',
+    borderColor: '#d9c89e',
     borderRadius: 10,
-    backgroundColor: '#f8fffb',
+    backgroundColor: '#f8f4eb',
     padding: 10,
     marginBottom: 12,
   },
@@ -3458,13 +3171,13 @@ const styles = StyleSheet.create({
   feedFilterTitle: {
     fontSize: 13,
     fontWeight: '700',
-    color: '#065f46',
+    color: '#2f6b3f',
   },
   filterToggleBtn: {
     borderRadius: 999,
     borderWidth: 1,
-    borderColor: '#34d399',
-    backgroundColor: '#d1fae5',
+    borderColor: '#2f6b3f',
+    backgroundColor: '#e4efdf',
     paddingHorizontal: 10,
     paddingVertical: 6,
   },
@@ -3475,7 +3188,7 @@ const styles = StyleSheet.create({
   filterToggleBtnText: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#065f46',
+    color: '#2f6b3f',
   },
   readOnlyGuardHint: {
     fontSize: 12,
@@ -3560,9 +3273,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingTop: 8,
     paddingBottom: 10,
-    backgroundColor: '#ffffff',
+    backgroundColor: '#fffdf8',
     borderTopWidth: 1,
-    borderTopColor: '#e5e7eb',
+    borderTopColor: '#dfcfad',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -3583,8 +3296,8 @@ const styles = StyleSheet.create({
     borderColor: 'transparent',
   },
   bottomNavItemActive: {
-    backgroundColor: '#ecfdf5',
-    borderColor: '#a7f3d0',
+    backgroundColor: '#edf2e8',
+    borderColor: '#d9c593',
   },
   bottomNavItemHover: {
     backgroundColor: '#f3f4f6',
@@ -3595,7 +3308,7 @@ const styles = StyleSheet.create({
     color: '#6b7280',
   },
   bottomNavTextActive: {
-    color: '#065f46',
+    color: '#2f6b3f',
   },
   bottomNavProfileItem: {
     width: 74,
@@ -3607,15 +3320,19 @@ const styles = StyleSheet.create({
     backgroundColor: '#ffffff',
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: '#000',
+    shadowColor: '#7cff9e',
     shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.18,
-    shadowRadius: 12,
+    shadowOpacity: 0.35,
+    shadowRadius: 14,
     elevation: 9,
   },
   bottomNavProfileItemActive: {
-    borderColor: '#86efac',
-    backgroundColor: '#ecfdf5',
+    borderColor: '#7cff9e',
+    backgroundColor: '#f6f1e5',
+    shadowColor: '#7cff9e',
+    shadowOpacity: 0.55,
+    shadowRadius: 20,
+    elevation: 12,
   },
   bottomNavProfileItemHover: {
     backgroundColor: '#f3f4f6',

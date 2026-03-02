@@ -2,6 +2,7 @@ import type { Event } from 'nostr-tools';
 import type { AuthState } from './authManager';
 import { getJson, setJson } from './persistentStorage';
 import { publishPublicDiary, fetchPublicDiaries, type RemoteDiary } from './nostrSync';
+import { extractMediaFromContent, parseMediaFromEventTags } from './mediaExtraction';
 
 export type DiarySyncStatus = 'local-only' | 'syncing' | 'synced' | 'error';
 
@@ -86,8 +87,9 @@ function diaryIdFromTitle(title: string): string {
 }
 
 function fromEvent(event: Event): DiaryItemRef {
-  const firstImage = event.tags
-    .find((tag) => tag[0] === 'url' && typeof tag[1] === 'string' && /\.(jpg|jpeg|png|webp|gif|avif)(\?.*)?$/i.test(tag[1]))?.[1];
+  const tagMedia = parseMediaFromEventTags(event);
+  const textMedia = extractMediaFromContent(event.content || '');
+  const firstImage = tagMedia.images[0] || textMedia.images[0];
 
   return {
     eventId: event.id,

@@ -14,6 +14,8 @@ interface PostMediaRendererProps {
   content: string;
   tags?: string[][];
   textNumberOfLines?: number;
+  imageResizeMode?: 'cover' | 'contain';
+  singleImageHeight?: number;
 }
 
 interface ViewerState {
@@ -21,7 +23,13 @@ interface ViewerState {
   index: number;
 }
 
-export function PostMediaRenderer({ content, tags, textNumberOfLines = 6 }: PostMediaRendererProps) {
+export function PostMediaRenderer({
+  content,
+  tags,
+  textNumberOfLines = 6,
+  imageResizeMode = 'cover',
+  singleImageHeight,
+}: PostMediaRendererProps) {
   const { width } = useWindowDimensions();
   const viewerScrollRef = useRef<ScrollView | null>(null);
   const baseMedia = useMemo<ExtractedMedia>(() => {
@@ -127,8 +135,14 @@ export function PostMediaRenderer({ content, tags, textNumberOfLines = 6 }: Post
               >
                 <Image
                   source={{ uri: visibleImages[0] }}
-                  style={styles.singleImage}
-                  resizeMode="cover"
+                  style={[
+                    styles.singleImage,
+                    imageResizeMode === 'contain' && styles.singleImageContain,
+                    typeof singleImageHeight === 'number'
+                      ? { height: singleImageHeight, aspectRatio: undefined }
+                      : null,
+                  ]}
+                  resizeMode={imageResizeMode}
                   onError={() => setHiddenImages(new Set([...hiddenImages, visibleImages[0]]))}
                 />
               </TouchableOpacity>
@@ -258,6 +272,9 @@ const styles = StyleSheet.create({
     width: '100%',
     height: '100%',
     aspectRatio: 16 / 9,
+  },
+  singleImageContain: {
+    backgroundColor: '#0f172a',
   },
   imageGrid: {
     flexDirection: 'row',
