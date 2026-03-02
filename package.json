@@ -8,8 +8,10 @@
     "ios": "HOME=. EXPO_NO_TELEMETRY=1 expo start --ios",
     "build": "HOME=. EXPO_NO_TELEMETRY=1 expo export --platform web",
     "preview": "python3 -m http.server 4173 --bind 127.0.0.1 --directory dist",
-    "lint": "test -x ./node_modules/.bin/eslint && ./node_modules/.bin/eslint -c .eslintrc.json . || (echo 'Install dependencies first: npm install' && exit 1)",
-    "type-check": "tsc --noEmit"
+    "lint": "test -x ./node_modules/.bin/eslint && ./node_modules/.bin/eslint -c .eslintrc.json app src App.tsx || (echo 'Install dependencies first: npm install' && exit 1)",
+    "type-check": "tsc --noEmit",
+    "test": "npm run test:unit",
+    "test:unit": "rm -rf .test-dist && tsc -p tsconfig.tests.json && printf '{\"type\":\"module\"}' > .test-dist/package.json && mkdir -p .test-dist/node_modules/@react-native-async-storage/async-storage .test-dist/node_modules/expo-secure-store && cp tests/stubs-runtime/async-storage.js .test-dist/node_modules/@react-native-async-storage/async-storage/index.js && cp tests/stubs-runtime/expo-secure-store.js .test-dist/node_modules/expo-secure-store/index.js && node --experimental-specifier-resolution=node --test .test-dist/tests/unit/*.test.js"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.0.0",

@@ -1,54 +1,65 @@
 import type { Event as NostrEvent, UnsignedEvent, Filter } from 'nostr-tools';
-import { SimplePool, finalizeEvent } from 'nostr-tools';
+import { SimplePool } from 'nostr-tools';
 import type { AuthState } from './authManager';
 import type { Diary, DiaryItemRef } from './diaryStore';
 import type { GrowmiesState } from './growmiesStore';
+import { requireAtLeastOneSuccess } from './networkResult';
+import { assertNoSensitiveMaterial } from './securityBaseline';
+import { LocalSigner } from './signers/localSigner';
+import { ensureSignerBoundIdentity, getDefaultSigner, setLocalSignerPrivkey } from './signers/signerManager';
+import type { Signer } from './signers/types';
 
 const DIARY_KIND = 30078;
 const GROWMIES_KIND = 30000;
 
-interface BrowserSigner {
-  getPublicKey?: () => Promise<string>;
-  signEvent?: (event: UnsignedEvent) => Promise<NostrEvent>;
-}
-
 export interface RemoteDiary {
   id: string;
   title: string;
+  plant?: string;
+  phase?: string;
+  coverImage?: string;
   createdAt: number;
   updatedAt: number;
   isPublic: boolean;
   items: DiaryItemRef[];
 }
 
-function hexToBytes(hex: string): Uint8Array {
-  const normalized = hex.trim().toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(normalized)) {
-    throw new Error('Invalid private key for signing');
-  }
-  const bytes = new Uint8Array(32);
-  for (let i = 0; i < 32; i++) {
-    bytes[i] = parseInt(normalized.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
-
 async function signUnsignedEvent(unsignedEvent: UnsignedEvent, authState: AuthState): Promise<NostrEvent> {
+  let signer: Signer;
+
   if (authState.method === 'nsec' && authState.privkey) {
-    return finalizeEvent(unsignedEvent, hexToBytes(authState.privkey));
+    signer = new LocalSigner(authState.privkey);
+  } else {
+    setLocalSignerPrivkey(null);
+    signer = getDefaultSigner();
   }
 
-  if (authState.method === 'signer' && typeof window !== 'undefined') {
-    const signer = (window as unknown as { nostr?: BrowserSigner }).nostr;
-    if (signer && typeof signer.signEvent === 'function') {
-      return await signer.signEvent(unsignedEvent);
-    }
+  const available = await signer.isAvailable();
+  if (!available) {
+    throw new Error('No signing method available');
   }
 
-  throw new Error('No signing method available');
+  const signerPubkey = await ensureSignerBoundIdentity(signer);
+  if (authState.pubkey && authState.method === 'signer' && authState.pubkey !== signerPubkey) {
+    throw new Error('Signer identity mismatch with authenticated user');
+  }
+
+  const toSign: UnsignedEvent & { id?: string; sig?: string } = {
+    ...unsignedEvent,
+    pubkey: signerPubkey,
+  };
+
+  const signed = await signer.signEvent(toSign);
+  if (!signed?.id || !signed?.sig) {
+    throw new Error('Signer returned invalid signed event');
+  }
+
+  return signed as NostrEvent;
 }
 
 function buildDiaryUnsignedEvent(diary: Diary, pubkey: string): UnsignedEvent {
+  assertNoSensitiveMaterial(diary.title, 'diary.title');
+
   const tags: string[][] = [
     ['d', `diary-${diary.id}`],
     ['title', diary.title],
@@ -62,6 +73,9 @@ function buildDiaryUnsignedEvent(diary: Diary, pubkey: string): UnsignedEvent {
   const content = JSON.stringify({
     id: diary.id,
     title: diary.title,
+    plant: diary.plant,
+    phase: diary.phase,
+    coverImage: diary.coverImage,
     updatedAt: diary.updatedAt,
     createdAt: diary.createdAt,
     items: diary.items,
@@ -77,6 +91,8 @@ function buildDiaryUnsignedEvent(diary: Diary, pubkey: string): UnsignedEvent {
 }
 
 function buildGrowmiesUnsignedEvent(state: GrowmiesState, pubkey: string): UnsignedEvent {
+  assertNoSensitiveMaterial(state.title, 'growmies.title');
+
   const tags: string[][] = [
     ['d', 'growmies'],
     ['title', state.title],
@@ -110,12 +126,8 @@ export async function publishPublicDiary(diary: Diary, authState: AuthState, rel
   const pool = new SimplePool();
   const signed = await signUnsignedEvent(buildDiaryUnsignedEvent(diary, authState.pubkey), authState);
 
-  const results = await Promise.allSettled(pool.publish(relayUrls, signed));
-  const ok = results.some((item) => item.status === 'fulfilled');
+  await requireAtLeastOneSuccess(pool.publish(relayUrls, signed), 'Failed to publish diary to relays');
   pool.close(relayUrls);
-  if (!ok) {
-    throw new Error('Failed to publish diary to relays');
-  }
 }
 
 export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): Promise<RemoteDiary[]> {
@@ -151,6 +163,9 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
       try {
         const parsed = JSON.parse(event.content || '{}') as {
           title?: string;
+          plant?: string;
+          phase?: string;
+          coverImage?: string;
           createdAt?: number;
           updatedAt?: number;
           items?: DiaryItemRef[];
@@ -174,6 +189,9 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
         remote.push({
           id,
           title: parsed.title?.trim() || id,
+          plant: typeof parsed.plant === 'string' ? parsed.plant.trim() || undefined : undefined,
+          phase: typeof parsed.phase === 'string' ? parsed.phase.trim() || undefined : undefined,
+          coverImage: typeof parsed.coverImage === 'string' ? parsed.coverImage.trim() || undefined : undefined,
           createdAt: parsed.createdAt || event.created_at,
           updatedAt: parsed.updatedAt || event.created_at,
           isPublic: true,
@@ -200,13 +218,8 @@ export async function publishGrowmiesList(state: GrowmiesState, authState: AuthS
 
   const pool = new SimplePool();
   const signed = await signUnsignedEvent(buildGrowmiesUnsignedEvent(state, authState.pubkey), authState);
-  const results = await Promise.allSettled(pool.publish(relayUrls, signed));
-  const ok = results.some((item) => item.status === 'fulfilled');
+  await requireAtLeastOneSuccess(pool.publish(relayUrls, signed), 'Failed to publish Growmies list');
   pool.close(relayUrls);
-
-  if (!ok) {
-    throw new Error('Failed to publish Growmies list');
-  }
 }
 
 export async function fetchGrowmiesList(pubkey: string, relayUrls: string[]): Promise<{ authors: string[] } | null> {

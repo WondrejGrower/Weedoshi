@@ -1,3 +1,5 @@
+import { logger } from './logger';
+
 /**
  * Diagnostics utility for debugging Nostr connections
  */
@@ -26,13 +28,13 @@ class Diagnostics {
     // Also log to console
     switch (level) {
       case 'error':
-        console.error(logEntry);
+        logger.error(logEntry);
         break;
       case 'warn':
-        console.warn(logEntry);
+        logger.warn(logEntry);
         break;
       default:
-        console.log(logEntry);
+        logger.info(logEntry);
     }
   }
 

@@ -1,7 +1,9 @@
 import { diagnostics } from './diagnostics';
+import { logger } from './logger';
 import type { Event, Filter } from 'nostr-tools';
 import { finalizeEvent, SimplePool } from 'nostr-tools';
 import { batchRequestManager } from './batchRequestManager';
+import { requireAtLeastOneSuccess } from './networkResult';
 
 function hexToBytes(hex: string): Uint8Array {
   const normalized = hex.trim().toLowerCase();
@@ -75,15 +77,14 @@ export class ReactionManager {
       const secretKey = typeof privkey === 'string' ? hexToBytes(privkey) : privkey;
       const signedEvent = finalizeEvent(reactionEvent, secretKey as any);
 
-      // Publish to all relays (at least one must succeed)
-      const publishPromises = relayUrls.map(relay =>
-        this.pool.publish([relay], signedEvent as any)
+      // Publish to all relays and require at least one success.
+      await requireAtLeastOneSuccess(
+        this.pool.publish(relayUrls, signedEvent as any),
+        'Failed to publish reaction to relays'
       );
 
-      await Promise.race(publishPromises);
-
       diagnostics.log(`✅ Reaction ${emoji} published successfully`, 'info');
-      console.log(`✅ Reaction published: ${emoji}`);
+      logger.info(`✅ Reaction published: ${emoji}`);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
       diagnostics.log(`❌ Failed to publish reaction: ${errorMsg}`, 'error');
@@ -124,8 +125,10 @@ export class ReactionManager {
         throw new Error('Signer did not return a valid signed event');
       }
 
-      const publishPromises = relayUrls.map(relay => this.pool.publish([relay], signedEvent));
-      await Promise.race(publishPromises);
+      await requireAtLeastOneSuccess(
+        this.pool.publish(relayUrls, signedEvent),
+        'Failed to publish signer reaction to relays'
+      );
       diagnostics.log(`✅ Reaction ${emoji} published via browser signer`, 'info');
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';

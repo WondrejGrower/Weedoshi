@@ -1,4 +1,5 @@
 import type { Event, Filter } from 'nostr-tools';
+import { logger } from './logger';
 import { SimplePool, nip19, getPublicKey } from 'nostr-tools';
 import { diagnostics } from './diagnostics';
 import { eventDeduplicator } from './eventDeduplicator';
@@ -27,28 +28,31 @@ export class NostrClient {
   private connectionTimeouts: Map<string, number> = new Map();
 
   constructor() {
-    console.log('🌐 NostrClient: Initializing...');
+    logger.info('🌐 NostrClient: Initializing...');
     try {
-      console.log('🌐 NostrClient: Creating SimplePool...');
+      logger.info('🌐 NostrClient: Creating SimplePool...');
       this.pool = new SimplePool();
-      console.log('✅ NostrClient: SimplePool created successfully');
-      console.log('🌐 NostrClient: Checking WebSocket availability...');
+      logger.info('✅ NostrClient: SimplePool created successfully');
+      logger.info('🌐 NostrClient: Checking WebSocket availability...');
       if (typeof WebSocket === 'undefined') {
-        console.error('🔴 NostrClient: WebSocket is undefined! This will cause issues.');
+        logger.error('🔴 NostrClient: WebSocket is undefined! This will cause issues.');
       } else {
-        console.log('✅ NostrClient: WebSocket is available');
+        logger.info('✅ NostrClient: WebSocket is available');
       }
     } catch (error) {
-      console.error('🔴 NostrClient: Constructor error:', error);
+      logger.error('🔴 NostrClient: Constructor error:', error);
       throw error;
     }
   }
 
   setRelays(urls: string[]) {
     this.relayUrls = urls.filter(url => {
+      if (typeof URL.canParse === 'function') {
+        return URL.canParse(url);
+      }
       try {
-        new URL(url);
-        return true;
+        const parsed = new URL(url);
+        return Boolean(parsed);
       } catch {
         return false;
       }
@@ -65,19 +69,19 @@ export class NostrClient {
     onEvent: (event: NostrEvent) => void,
     onTimeout?: () => void
   ): Promise<string> {
-    console.log('🌐 NostrClient: subscribeFeed called');
-    console.log('🌐 NostrClient: Relay URLs:', this.relayUrls);
-    console.log('🌐 NostrClient: Hashtags:', hashtags);
-    console.log('🌐 NostrClient: Since:', new Date(since * 1000).toISOString());
+    logger.info('🌐 NostrClient: subscribeFeed called');
+    logger.info('🌐 NostrClient: Relay URLs:', this.relayUrls);
+    logger.info('🌐 NostrClient: Hashtags:', hashtags);
+    logger.info('🌐 NostrClient: Since:', new Date(since * 1000).toISOString());
     if (this.relayUrls.length === 0) {
-      console.error('🔴 NostrClient: No relays configured!');
+      logger.error('🔴 NostrClient: No relays configured!');
       diagnostics.log('No relays configured', 'error');
       throw new Error('No relays configured');
     }
 
     diagnostics.log(`Starting subscription to ${this.relayUrls.length} relays`, 'info');
-    console.log('🌐 NostrClient: Starting subscribeFeed...');
-    console.log(`🌐 NostrClient: Relays: ${this.relayUrls.join(', ')}`);
+    logger.info('🌐 NostrClient: Starting subscribeFeed...');
+    logger.info(`🌐 NostrClient: Relays: ${this.relayUrls.join(', ')}`);
 
     // Initialize health tracking for all relays
     this.relayUrls.forEach(url => {
@@ -102,7 +106,7 @@ export class NostrClient {
       const cachedEvents = await eventCache.getEvents(filter);
       if (cachedEvents.length > 0) {
         diagnostics.log(`📦 Loaded ${cachedEvents.length} events from cache`, 'info');
-        console.log(`📦 Cache: ${cachedEvents.length} events loaded instantly`);
+        logger.info(`📦 Cache: ${cachedEvents.length} events loaded instantly`);
 
         // Deliver cached events immediately
         cachedEvents.forEach(event => {
@@ -123,7 +127,7 @@ export class NostrClient {
     const timeoutId = setTimeout(() => {
       if (!eventReceived && !timeoutFired) {
         diagnostics.log('Subscription timeout - no events received within 5s', 'warn');
-        console.warn('⚠️ Nostr subscription timeout - no events received within 5s');
+        logger.warn('⚠️ Nostr subscription timeout - no events received within 5s');
 
         // Mark all relays as failed if no events received
         this.relayUrls.forEach(url => {
@@ -178,11 +182,11 @@ export class NostrClient {
             `End of stored events - ${eventCount} unique, ${duplicateCount} duplicates filtered`,
             'info'
           );
-          console.log(`✅ Nostr: ${eventCount} unique events (${duplicateCount} duplicates filtered)`);
-          console.log(`📊 Deduplication:`, dedupStats);
-          console.log(`🔒 Validation:`, validatorStats);
-          console.log(`💚 Relay Health:`, healthStats);
-          console.log(`📦 Cache:`, cacheStats);
+          logger.info(`✅ Nostr: ${eventCount} unique events (${duplicateCount} duplicates filtered)`);
+          logger.info(`📊 Deduplication:`, dedupStats);
+          logger.info(`🔒 Validation:`, validatorStats);
+          logger.info(`💚 Relay Health:`, healthStats);
+          logger.info(`📦 Cache:`, cacheStats);
           eventReceived = true;
         },
       });
@@ -230,6 +234,50 @@ export class NostrClient {
     } catch (error) {
       diagnostics.log(
         `Fallback public notes fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+        'warn'
+      );
+      return [];
+    }
+  }
+
+  async fetchNotesByTagHashtags(
+    hashtags: string[],
+    limit: number = 300,
+    maxWaitMs: number = 7000
+  ): Promise<NostrEvent[]> {
+    if (this.relayUrls.length === 0 || hashtags.length === 0) {
+      return [];
+    }
+
+    const normalized = Array.from(
+      new Set(
+        hashtags
+          .map((tag) => tag.trim().toLowerCase())
+          .filter(Boolean)
+      )
+    );
+    if (normalized.length === 0) {
+      return [];
+    }
+
+    const filter: Filter = {
+      kinds: [1],
+      '#t': normalized,
+      limit,
+    };
+
+    try {
+      const events = await this.pool.querySync(this.relayUrls, filter as any, {
+        maxWait: maxWaitMs,
+        label: 'hashtag-backfill',
+      });
+
+      return events
+        .filter((event) => eventValidator.validateEvent(event))
+        .map((event) => ({ ...event }));
+    } catch (error) {
+      diagnostics.log(
+        `Hashtag backfill fetch failed: ${error instanceof Error ? error.message : String(error)}`,
         'warn'
       );
       return [];

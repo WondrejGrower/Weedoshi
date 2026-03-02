@@ -1,3 +1,4 @@
+import type { ComponentProps } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Image, Modal, Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View, useWindowDimensions } from 'react-native';
 import { LinkPreviewCard } from './LinkPreviewCard';
@@ -62,12 +63,14 @@ export function PostMediaRenderer({ content, tags, textNumberOfLines = 6 }: Post
       };
     }
 
-    void (async () => {
+    (async () => {
       const enhanced = await enhanceMediaWithHead(baseMedia, 1500);
       if (!canceled) {
         setMedia(enhanced);
       }
-    })();
+    })().catch(() => {
+      // Ignore media enhancement errors.
+    });
 
     return () => {
       canceled = true;
@@ -103,7 +106,7 @@ export function PostMediaRenderer({ content, tags, textNumberOfLines = 6 }: Post
       x: viewer.index * modalImageWidth,
       animated: false,
     });
-  }, [viewer?.index, viewer?.images.length, modalImageWidth]);
+  }, [viewer, modalImageWidth]);
 
   return (
     <View>
@@ -157,9 +160,8 @@ export function PostMediaRenderer({ content, tags, textNumberOfLines = 6 }: Post
         <View style={styles.videoFrame}>
           {Platform.OS === 'web' ? (
             // Web-only native video element for stable browser playback.
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (() => {
-              const VideoTag = 'video' as any;
+              const VideoTag = 'video' as unknown as React.ComponentType<ComponentProps<'video'>>;
               return (
                 <VideoTag
                   controls

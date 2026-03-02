@@ -1,4 +1,5 @@
 import { diagnostics } from './diagnostics';
+import { logger } from './logger';
 import type { Event, Filter } from 'nostr-tools';
 import { SimplePool } from 'nostr-tools';
 
@@ -38,12 +39,12 @@ export class BatchRequestManager {
   private latencyHistory: number[] = [];
 
   constructor() {
-    console.log('📦 BatchRequestManager: Initializing...');
+    logger.info('📦 BatchRequestManager: Initializing...');
     try {
       this.pool = new SimplePool();
-      console.log('✅ BatchRequestManager: SimplePool created');
+      logger.info('✅ BatchRequestManager: SimplePool created');
     } catch (error) {
-      console.error('🔴 BatchRequestManager: Constructor error:', error);
+      logger.error('🔴 BatchRequestManager: Constructor error:', error);
       throw error;
     }
   }
@@ -116,7 +117,7 @@ export class BatchRequestManager {
     const batchSize = requests.length;
 
     diagnostics.log(`Executing batch of ${batchSize} requests`, 'info');
-    console.log(`📦 Batch execution: ${batchSize} requests`);
+    logger.info(`📦 Batch execution: ${batchSize} requests`);
 
     // Group requests by relay URLs to optimize
     const relayGroups = this.groupByRelays(requests);

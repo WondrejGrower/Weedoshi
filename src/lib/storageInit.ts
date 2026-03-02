@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { logger } from './logger';
 
 let isInitialized = false;
 
@@ -8,40 +9,40 @@ let isInitialized = false;
  */
 export async function initializeStorage(): Promise<void> {
   if (isInitialized) {
-    console.log('📦 Storage: Already initialized, skipping');
+    logger.info('📦 Storage: Already initialized, skipping');
     return;
   }
 
   try {
-    console.log('📦 Storage: Starting initialization...');
-    console.log('📦 Storage: Testing AsyncStorage availability...');
+    logger.info('📦 Storage: Starting initialization...');
+    logger.info('📦 Storage: Testing AsyncStorage availability...');
 
     // Test AsyncStorage is available
     const testKey = '@weedoshi:init_test';
     const testValue = 'test';
 
-    console.log('📦 Storage: Writing test value...');
+    logger.info('📦 Storage: Writing test value...');
     await AsyncStorage.setItem(testKey, testValue);
-    console.log('✅ Storage: Test write successful');
+    logger.info('✅ Storage: Test write successful');
 
-    console.log('📦 Storage: Reading test value...');
+    logger.info('📦 Storage: Reading test value...');
     const result = await AsyncStorage.getItem(testKey);
-    console.log('✅ Storage: Test read successful, value:', result);
+    logger.info('✅ Storage: Test read successful, value:', result);
 
     if (result !== testValue) {
       throw new Error(`Storage test failed: expected "${testValue}", got "${result}"`);
     }
 
-    console.log('📦 Storage: Removing test value...');
+    logger.info('📦 Storage: Removing test value...');
     await AsyncStorage.removeItem(testKey);
-    console.log('✅ Storage: Test cleanup successful');
+    logger.info('✅ Storage: Test cleanup successful');
 
     isInitialized = true;
-    console.log('🎉 Storage: Initialization complete!');
+    logger.info('🎉 Storage: Initialization complete!');
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    console.error('🔴 Storage: Initialization failed:', errorMsg);
-    console.error('🔴 Storage: Error details:', error);
+    logger.error('🔴 Storage: Initialization failed:', errorMsg);
+    logger.error('🔴 Storage: Error details:', error);
     throw new Error(`AsyncStorage initialization failed: ${errorMsg}`);
   }
 }

@@ -99,7 +99,7 @@ assets/
 ## Security Notes
 
 - `nsec` is stored in secure storage on native platforms (`expo-secure-store`).
-- On web fallback, storage is less secure; treat browser environment as lower trust.
+- On web app mode, `nsec` is kept in session memory only (not persisted across refresh/restart).
 - Never share your `nsec`.
 
 ## Documentation

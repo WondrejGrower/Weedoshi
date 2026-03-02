@@ -1,53 +1,14 @@
 import * as SecureStore from 'expo-secure-store';
-import { Platform } from 'react-native';
 import { diagnostics } from './diagnostics';
 import { getFeatures } from '../runtime/features';
 import { getRuntimeMode } from '../runtime/mode';
 
 const STORAGE_KEY = 'nostr_private_key';
 const PUBKEY_KEY = 'nostr_public_key';
-const WEB_APP_ENCRYPTED_PREFIX = 'enc:v1:';
-const WEB_APP_FALLBACK_SECRET = 'weedoshi-web-app-storage';
+let webSessionKey: string | null = null;
 
-function toBase64(value: string): string {
-  if (typeof btoa === 'function') {
-    return btoa(value);
-  }
-  return Buffer.from(value, 'utf-8').toString('base64');
-}
-
-function fromBase64(value: string): string {
-  if (typeof atob === 'function') {
-    return atob(value);
-  }
-  return Buffer.from(value, 'base64').toString('utf-8');
-}
-
-function xorCipher(input: string, secret: string): string {
-  let output = '';
-  for (let i = 0; i < input.length; i++) {
-    const charCode = input.charCodeAt(i) ^ secret.charCodeAt(i % secret.length);
-    output += String.fromCharCode(charCode);
-  }
-  return output;
-}
-
-function encryptForWeb(nsec: string, pubkey: string): string {
-  const cipher = xorCipher(nsec, `${WEB_APP_FALLBACK_SECRET}:${pubkey}`);
-  return `${WEB_APP_ENCRYPTED_PREFIX}${toBase64(cipher)}`;
-}
-
-function decryptForWeb(payload: string, pubkey: string): string | null {
-  try {
-    if (!payload.startsWith(WEB_APP_ENCRYPTED_PREFIX)) {
-      return payload;
-    }
-    const encoded = payload.slice(WEB_APP_ENCRYPTED_PREFIX.length);
-    const cipher = fromBase64(encoded);
-    return xorCipher(cipher, `${WEB_APP_FALLBACK_SECRET}:${pubkey}`);
-  } catch {
-    return null;
-  }
+function isWebRuntime(): boolean {
+  return typeof window !== 'undefined' && typeof document !== 'undefined';
 }
 
 /**
@@ -62,18 +23,19 @@ export class SecureKeyManager {
    */
   async storeKey(nsec: string, pubkey: string): Promise<void> {
     try {
-      if (Platform.OS === 'web') {
+      if (isWebRuntime()) {
         const features = getFeatures(getRuntimeMode());
         if (features.requireBrowserSigner) {
           throw new Error('nsec storage is disabled in web mode');
         }
 
-        // App mode on web: encrypted fallback (still lower trust than native secure storage).
+        // Web app mode: keep nsec in runtime memory only.
+        // We intentionally avoid persistent browser storage for private keys.
         diagnostics.log(
-          '⚠️ Web app mode: Using encrypted localStorage fallback (prefer native secure storage)',
+          '⚠️ Web app mode: nsec is held in session memory only (not persisted)',
           'warn'
         );
-        localStorage.setItem(STORAGE_KEY, encryptForWeb(nsec, pubkey));
+        webSessionKey = nsec;
         localStorage.setItem(PUBKEY_KEY, pubkey);
       } else {
         // Native platforms - use secure storage
@@ -98,16 +60,13 @@ export class SecureKeyManager {
    */
   async getKey(): Promise<string | null> {
     try {
-      if (Platform.OS === 'web') {
+      if (isWebRuntime()) {
         const features = getFeatures(getRuntimeMode());
         if (features.requireBrowserSigner) {
           return null;
         }
 
-        const pubkey = localStorage.getItem(PUBKEY_KEY);
-        const payload = localStorage.getItem(STORAGE_KEY);
-        if (!payload || !pubkey) return null;
-        return decryptForWeb(payload, pubkey);
+        return webSessionKey;
       } else {
         return await SecureStore.getItemAsync(STORAGE_KEY);
       }
@@ -123,7 +82,7 @@ export class SecureKeyManager {
    */
   async getPubkey(): Promise<string | null> {
     try {
-      if (Platform.OS === 'web') {
+      if (isWebRuntime()) {
         return localStorage.getItem(PUBKEY_KEY);
       } else {
         return await SecureStore.getItemAsync(PUBKEY_KEY);
@@ -140,8 +99,8 @@ export class SecureKeyManager {
    */
   async deleteKey(): Promise<void> {
     try {
-      if (Platform.OS === 'web') {
-        localStorage.removeItem(STORAGE_KEY);
+      if (isWebRuntime()) {
+        webSessionKey = null;
         localStorage.removeItem(PUBKEY_KEY);
       } else {
         await SecureStore.deleteItemAsync(STORAGE_KEY);
@@ -166,7 +125,7 @@ export class SecureKeyManager {
    * Check if secure storage is available (native platforms)
    */
   isSecureStorageAvailable(): boolean {
-    return Platform.OS !== 'web';
+    return !isWebRuntime();
   }
 }
 

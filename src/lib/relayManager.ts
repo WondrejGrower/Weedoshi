@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { logger } from './logger';
 
 export interface Relay {
   url: string;
@@ -51,9 +52,19 @@ class RelayManager {
   }
 
   addRelay(url: string): boolean {
-    try {
-      new URL(url);
-    } catch {
+    const isValidUrl =
+      typeof URL.canParse === 'function'
+        ? URL.canParse(url)
+        : (() => {
+            try {
+              const parsed = new URL(url);
+              return Boolean(parsed);
+            } catch {
+              return false;
+            }
+          })();
+
+    if (!isValidUrl) {
       throw new Error('Invalid relay URL');
     }
 
@@ -75,7 +86,7 @@ class RelayManager {
     try {
       await AsyncStorage.setItem('nostr_relays', JSON.stringify(this.relays));
     } catch (error) {
-      console.warn('Failed to save relays:', error);
+      logger.warn('Failed to save relays:', error);
     }
   }
 
@@ -86,7 +97,7 @@ class RelayManager {
         this.relays = JSON.parse(stored);
       }
     } catch (error) {
-      console.warn('Failed to load relays:', error);
+      logger.warn('Failed to load relays:', error);
     }
   }
 }

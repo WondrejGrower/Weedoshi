@@ -11,12 +11,16 @@ export interface DiaryItemRef {
   createdAt: number;
   contentPreview?: string;
   image?: string;
+  phaseLabel?: string;
   addedAt: number;
 }
 
 export interface Diary {
   id: string;
   title: string;
+  plant?: string;
+  phase?: string;
+  coverImage?: string;
   createdAt: number;
   updatedAt: number;
   isPublic: boolean;
@@ -56,6 +60,19 @@ function nowTs(): number {
 function normalizeTitle(title: string): string {
   const trimmed = title.trim();
   return trimmed.length > 0 ? trimmed : 'Untitled Diary';
+}
+
+function normalizeOptionalField(value: string | undefined): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeImageUrl(value: string | undefined): string | undefined {
+  const normalized = normalizeOptionalField(value);
+  if (!normalized) return undefined;
+  if (!/^https?:\/\//i.test(normalized)) return undefined;
+  return normalized;
 }
 
 function diaryIdFromTitle(title: string): string {
@@ -127,11 +144,17 @@ class DiaryStore {
     await this.persist();
   }
 
-  async createDiary(title: string, isPublic: boolean = false): Promise<Diary> {
+  async createDiary(
+    title: string,
+    isPublic: boolean = false,
+    details?: { plant?: string; phase?: string }
+  ): Promise<Diary> {
     const ts = nowTs();
     const diary: Diary = {
       id: diaryIdFromTitle(title),
       title: normalizeTitle(title),
+      plant: normalizeOptionalField(details?.plant),
+      phase: normalizeOptionalField(details?.phase),
       createdAt: ts,
       updatedAt: ts,
       isPublic,
@@ -148,6 +171,39 @@ class DiaryStore {
     const diary = this.getDiary(id);
     if (!diary) return;
     diary.title = normalizeTitle(title);
+    diary.updatedAt = nowTs();
+    if (diary.syncStatus === 'synced') {
+      diary.syncStatus = 'local-only';
+    }
+    await this.persist();
+  }
+
+  async updateDiaryDetails(id: string, details: { title?: string; plant?: string; phase?: string }): Promise<void> {
+    const diary = this.getDiary(id);
+    if (!diary) return;
+
+    if (typeof details.title === 'string') {
+      diary.title = normalizeTitle(details.title);
+    }
+    if (typeof details.plant === 'string') {
+      diary.plant = normalizeOptionalField(details.plant);
+    }
+    if (typeof details.phase === 'string') {
+      diary.phase = normalizeOptionalField(details.phase);
+    }
+    diary.updatedAt = nowTs();
+    if (diary.syncStatus === 'synced') {
+      diary.syncStatus = 'local-only';
+    }
+    await this.persist();
+  }
+
+  async setDiaryCoverImage(id: string, coverImage?: string): Promise<void> {
+    const diary = this.getDiary(id);
+    if (!diary) return;
+    const normalized = normalizeImageUrl(coverImage);
+    if (diary.coverImage === normalized) return;
+    diary.coverImage = normalized;
     diary.updatedAt = nowTs();
     if (diary.syncStatus === 'synced') {
       diary.syncStatus = 'local-only';
@@ -175,13 +231,77 @@ class DiaryStore {
     await this.persist();
   }
 
-  async addItemToDiary(diaryId: string, event: Event): Promise<void> {
+  async addItemToDiary(diaryId: string, event: Event, phaseLabel?: string): Promise<void> {
     const diary = this.getDiary(diaryId);
     if (!diary) return;
     if (diary.items.some((item) => item.eventId === event.id)) {
       return;
     }
-    diary.items.unshift(fromEvent(event));
+    const ref = fromEvent(event);
+    ref.phaseLabel = normalizeOptionalField(phaseLabel);
+    diary.items.unshift(ref);
+    if (!diary.coverImage && ref.image) {
+      diary.coverImage = normalizeImageUrl(ref.image);
+    }
+    diary.updatedAt = nowTs();
+    if (diary.syncStatus === 'synced') {
+      diary.syncStatus = 'local-only';
+    }
+    await this.persist();
+  }
+
+  async setDiaryItemPhaseLabels(diaryId: string, labelsByEventId: Record<string, string>): Promise<void> {
+    const diary = this.getDiary(diaryId);
+    if (!diary) return;
+    const labelKeys = new Set(Object.keys(labelsByEventId));
+    if (labelKeys.size === 0) return;
+    let changed = false;
+    for (const item of diary.items) {
+      if (!labelKeys.has(item.eventId)) {
+        continue;
+      }
+      const next = normalizeOptionalField(labelsByEventId[item.eventId]);
+      if (next !== item.phaseLabel) {
+        item.phaseLabel = next;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    diary.updatedAt = nowTs();
+    if (diary.syncStatus === 'synced') {
+      diary.syncStatus = 'local-only';
+    }
+    await this.persist();
+  }
+
+  async setDiaryItemOrder(diaryId: string, orderedEventIds: string[]): Promise<void> {
+    const diary = this.getDiary(diaryId);
+    if (!diary) return;
+    const requested = orderedEventIds.filter(Boolean);
+    if (requested.length === 0) return;
+
+    const itemById = new Map(diary.items.map((item) => [item.eventId, item]));
+    const seen = new Set<string>();
+    const reordered: DiaryItemRef[] = [];
+
+    for (const eventId of requested) {
+      if (seen.has(eventId)) continue;
+      const item = itemById.get(eventId);
+      if (!item) continue;
+      reordered.push(item);
+      seen.add(eventId);
+    }
+
+    for (const item of diary.items) {
+      if (!seen.has(item.eventId)) {
+        reordered.push(item);
+      }
+    }
+
+    const changed = reordered.some((item, index) => diary.items[index]?.eventId !== item.eventId);
+    if (!changed) return;
+
+    diary.items = reordered;
     diary.updatedAt = nowTs();
     if (diary.syncStatus === 'synced') {
       diary.syncStatus = 'local-only';
@@ -238,6 +358,9 @@ class DiaryStore {
     }
 
     existing.title = remote.title;
+    existing.plant = normalizeOptionalField(remote.plant);
+    existing.phase = normalizeOptionalField(remote.phase);
+    existing.coverImage = normalizeImageUrl(remote.coverImage);
     existing.items = remote.items;
     existing.updatedAt = remote.updatedAt;
     existing.isPublic = true;

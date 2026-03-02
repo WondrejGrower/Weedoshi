@@ -6,13 +6,14 @@ import { Stack } from 'expo-router';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import * as SplashScreen from 'expo-splash-screen';
 import { useEffect, useState } from 'react';
-import { View, ActivityIndicator, Text } from 'react-native';
+import { View, ActivityIndicator, Text, StyleSheet } from 'react-native';
 import { initializeStorage } from '../src/lib/storageInit';
 import { authManager } from '../src/lib/authManager';
 import { relayManager } from '../src/lib/relayManager';
 import { ErrorBoundary } from '../src/components/ErrorBoundary';
 import { getRuntimeMode } from '../src/runtime/mode';
 import { getFeatures } from '../src/runtime/features';
+import { logger } from '../src/lib/logger';
 
 SplashScreen.preventAutoHideAsync();
 
@@ -22,56 +23,56 @@ export default function RootLayout() {
 
   useEffect(() => {
     async function prepare() {
-      console.log('🚀 App: Starting initialization...');
-      console.log('🚀 App: Platform:', require('react-native').Platform.OS);
-      console.log('🚀 App: React Native version:', require('react-native').Platform.Version);
+      logger.info('🚀 App: Starting initialization...');
+      logger.info('🚀 App: Platform:', require('react-native').Platform.OS);
+      logger.info('🚀 App: React Native version:', require('react-native').Platform.Version);
 
       // Verify polyfills are loaded
-      console.log('🔍 App: Checking polyfills...');
-      console.log('🔍 App: WebSocket available:', typeof WebSocket !== 'undefined' ? '✅ YES' : '🔴 NO');
-      console.log('🔍 App: crypto.getRandomValues available:', 
+      logger.info('🔍 App: Checking polyfills...');
+      logger.info('🔍 App: WebSocket available:', typeof WebSocket !== 'undefined' ? '✅ YES' : '🔴 NO');
+      logger.info('🔍 App: crypto.getRandomValues available:', 
         typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function' ? '✅ YES' : '🔴 NO'
       );
       const runtimeMode = getRuntimeMode();
       const runtimeFeatures = getFeatures(runtimeMode);
-      console.log(`🧭 Runtime self-check: mode=${runtimeMode}`, runtimeFeatures);
+      logger.info(`🧭 Runtime self-check: mode=${runtimeMode}`, runtimeFeatures);
 
       // Timeout fallback - if init takes too long, proceed anyway
       const initTimeout = setTimeout(() => {
-        console.warn('⚠️ App: Initialization timeout (5s) - proceeding anyway');
+        logger.warn('⚠️ App: Initialization timeout (5s) - proceeding anyway');
         setInitError('Initialization timeout - some features may not work');
         setIsReady(true);
       }, 5000);
       try {
-        console.log('📦 App: Step 1/3 - Initializing storage...');
+        logger.info('📦 App: Step 1/3 - Initializing storage...');
         await initializeStorage();
-        console.log('✅ App: Storage initialized successfully');
+        logger.info('✅ App: Storage initialized successfully');
 
-        console.log('🔐 App: Step 2/3 - Loading auth state...');
+        logger.info('🔐 App: Step 2/3 - Loading auth state...');
         await authManager.loadState();
-        console.log('✅ App: Auth state loaded');
+        logger.info('✅ App: Auth state loaded');
 
-        console.log('🔄 App: Step 3/3 - Loading relay state...');
+        logger.info('🔄 App: Step 3/3 - Loading relay state...');
         await relayManager.loadState();
-        console.log('✅ App: Relay state loaded');
+        logger.info('✅ App: Relay state loaded');
 
         clearTimeout(initTimeout);
-        console.log('🎉 App: Initialization complete!');
+        logger.info('🎉 App: Initialization complete!');
         setIsReady(true);
       } catch (e) {
         clearTimeout(initTimeout);
         const errorMsg = e instanceof Error ? e.message : String(e);
-        console.error('🔴 App: Initialization error:', errorMsg);
-        console.error('🔴 App: Error stack:', e instanceof Error ? e.stack : 'No stack');
+        logger.error('🔴 App: Initialization error:', errorMsg);
+        logger.error('🔴 App: Error stack:', e instanceof Error ? e.stack : 'No stack');
         setInitError(errorMsg);
         setIsReady(true); // Still proceed even if storage fails
       } finally {
         try {
-          console.log('👋 App: Hiding splash screen...');
+          logger.info('👋 App: Hiding splash screen...');
           await SplashScreen.hideAsync();
-          console.log('✅ App: Splash screen hidden');
+          logger.info('✅ App: Splash screen hidden');
         } catch (splashError) {
-          console.error('⚠️ App: Failed to hide splash screen:', splashError);
+          logger.error('⚠️ App: Failed to hide splash screen:', splashError);
         }
       }
     }
@@ -80,24 +81,24 @@ export default function RootLayout() {
   }, []);
 
   if (!isReady) {
-    console.log('⏳ App: Showing loading screen...');
+    logger.info('⏳ App: Showing loading screen...');
     return (
-      <GestureHandlerRootView style={{ flex: 1 }}>
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#f9fafb' }}>
+      <GestureHandlerRootView style={styles.root}>
+        <View style={styles.loadingContainer}>
           <ActivityIndicator size="large" color="#059669" />
-          <Text style={{ marginTop: 16, color: '#6b7280' }}>Loading Weedoshi...</Text>
+          <Text style={styles.loadingText}>Loading Weedoshi...</Text>
         </View>
       </GestureHandlerRootView>
     );
   }
 
-  console.log('✅ App: Rendering main app...');
+  logger.info('✅ App: Rendering main app...');
   return (
     <ErrorBoundary>
-      <GestureHandlerRootView style={{ flex: 1 }}>
+      <GestureHandlerRootView style={styles.root}>
         {initError && (
-          <View style={{ backgroundColor: '#fee2e2', padding: 12 }}>
-            <Text style={{ color: '#991b1b', fontSize: 12 }}>
+          <View style={styles.warningBanner}>
+            <Text style={styles.warningText}>
               ⚠️ Init warning: {initError}
             </Text>
           </View>
@@ -114,3 +115,27 @@ export default function RootLayout() {
     </ErrorBoundary>
   );
 }
+
+const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#f9fafb',
+  },
+  loadingText: {
+    marginTop: 16,
+    color: '#6b7280',
+  },
+  warningBanner: {
+    backgroundColor: '#fee2e2',
+    padding: 12,
+  },
+  warningText: {
+    color: '#991b1b',
+    fontSize: 12,
+  },
+});

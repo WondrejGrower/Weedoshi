@@ -1,4 +1,5 @@
 import { relayHealthMonitor } from './relayHealthMonitor';
+import { logger } from './logger';
 import { relayManager } from './relayManager';
 import { diagnostics } from './diagnostics';
 import { relayLatencyProbe } from './relayLatencyProbe';
@@ -88,9 +89,9 @@ export class SmartRelaySelector {
       `Smart Relay Selection: Selected ${selected.length}/${count} relays`,
       'info'
     );
-    console.log('📊 Smart Relay Selection:');
+    logger.info('📊 Smart Relay Selection:');
     viable.slice(0, count).forEach((relay, i) => {
-      console.log(
+      logger.info(
         `  ${i + 1}. ${relay.url} - Score: ${relay.score.toFixed(1)} ` +
         `(${relay.latency.toFixed(0)}ms, ${(relay.successRate * 100).toFixed(0)}%)`
       );
@@ -170,7 +171,7 @@ export class SmartRelaySelector {
    */
   periodicUpdate(): boolean {
     if (this.shouldReEvaluate()) {
-      console.log('🔄 Re-evaluating relay selection...');
+      logger.info('🔄 Re-evaluating relay selection...');
       this.applySmartSelection();
       return true;
     }

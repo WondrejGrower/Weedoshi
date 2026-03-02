@@ -1,9 +1,10 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   View,
   Text,
   ScrollView,
   TouchableOpacity,
+  Pressable,
   TextInput,
   ActivityIndicator,
   SafeAreaView,
@@ -12,23 +13,20 @@ import {
   Image,
   Modal,
   useWindowDimensions,
+  Animated,
 } from 'react-native';
 import type { Event as NostrRawEvent } from 'nostr-tools';
 import { nostrClient } from '../src/lib/nostrClient';
 import { authManager } from '../src/lib/authManager';
 import { relayManager } from '../src/lib/relayManager';
-import { filterAndDeduplicateEvents, deduplicateAndFormatEvents } from '../src/lib/eventFilter';
 import { DiagnosticsPanel } from '../src/components/DiagnosticsPanel';
 import { ReactionBar } from '../src/components/ReactionBar';
 import { ThreadIndicator } from '../src/components/ThreadIndicator';
 import { SmartRelayPanel } from '../src/components/SmartRelayPanel';
 import { PostMediaRenderer } from '../src/components/PostMediaRenderer';
 import { reactionManager } from '../src/lib/reactionManager';
-import { threadManager } from '../src/lib/threadManager';
-import type { NostrEvent } from '../src/lib/nostrClient';
 import type { NostrProfileMetadata } from '../src/lib/nostrClient';
-import type { AuthState } from '../src/lib/authManager';
-import type { FilteredEvent } from '../src/lib/eventFilter';
+import type { AuthState, Nip46PairingState } from '../src/lib/authManager';
 import { getRuntimeMode } from '../src/runtime/mode';
 import { getFeatures } from '../src/runtime/features';
 import {
@@ -41,24 +39,61 @@ import {
 } from '../src/lib/diaryManager';
 import { diaryStore } from '../src/lib/diaryStore';
 import { growmiesStore } from '../src/lib/growmiesStore';
-
-const DEFAULT_HASHTAGS = ['weedoshi', 'growlog', 'weedstr', 'weed'];
-const DEFAULT_DIARY_CHAPTERS = [
-  ...Array.from({ length: 10 }, (_, i) => ({
-    key: `vegW${String(i + 1).padStart(2, '0')}`,
-    label: `Veg Week ${i + 1}`,
-  })),
-  ...Array.from({ length: 10 }, (_, i) => ({
-    key: `flowerW${String(i + 1).padStart(2, '0')}`,
-    label: `Flower Week ${i + 1}`,
-  })),
-];
+import { DEFAULT_HASHTAGS } from '../src/features/home/constants';
+import {
+  getAvatarLabel,
+  getDisplayName,
+  groupDiaryEntries,
+  shortPubkey,
+} from '../src/features/home/profileHelpers';
+import { useFeedController } from '../src/features/feed/useFeedController';
+import { logger } from '../src/lib/logger';
+import { assertNoSensitiveMaterial } from '../src/lib/securityBaseline';
+import { getAllHashtags } from '../src/lib/eventFilter';
+import { getJson, setJson } from '../src/lib/persistentStorage';
 
 const runtimeMode = getRuntimeMode();
 const features = getFeatures(runtimeMode);
 
 type MainPage = 'feed' | 'profile' | 'growmies' | 'settings';
 type ProfileTab = 'diary' | 'all';
+type SettingsSection = 'authentication' | 'relays' | 'hashtags' | 'growmies';
+const LOGIN_PROMPT_DISMISSED_KEY = 'login_prompt_dismissed_v1';
+const PHASE_TEMPLATE_OPTIONS = ['Seedling', 'Vegetation', 'Flowering', 'Harvest'];
+const PHASE_WEEK_SEPARATOR = ' :: ';
+
+function parsePhaseWeek(value: string): { phase: string; week: string } {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return { phase: '', week: '' };
+  }
+  if (trimmed.includes(PHASE_WEEK_SEPARATOR)) {
+    const [phasePart, ...rest] = trimmed.split(PHASE_WEEK_SEPARATOR);
+    return {
+      phase: phasePart.trim(),
+      week: rest.join(PHASE_WEEK_SEPARATOR).trim(),
+    };
+  }
+  const weekMatch = trimmed.match(/^(.*?)[\s-]*week\s*([0-9a-zA-Z-]+)$/i);
+  if (weekMatch) {
+    return {
+      phase: weekMatch[1].trim(),
+      week: weekMatch[2].trim(),
+    };
+  }
+  return { phase: trimmed, week: '' };
+}
+
+function composePhaseWeek(phaseValue: string, weekValue: string): string {
+  const phase = phaseValue.trim();
+  const week = weekValue.trim();
+  if (phase && week) {
+    return `${phase}${PHASE_WEEK_SEPARATOR}${week}`;
+  }
+  if (phase) return phase;
+  if (week) return `Week ${week}`;
+  return 'General';
+}
 
 type DiaryRunOption = {
   diaryId: string;
@@ -68,38 +103,24 @@ type DiaryRunOption = {
   itemCount: number;
 };
 
-function getDisplayName(auth: AuthState, metadata: NostrProfileMetadata | null): string {
-  if (metadata?.display_name?.trim()) return metadata.display_name.trim();
-  if (metadata?.name?.trim()) return metadata.name.trim();
-  if (!auth.pubkey) return 'Guest Grower';
-  return `Grower ${auth.pubkey.slice(0, 6)}`;
-}
-
-function getAvatarLabel(auth: AuthState, metadata: NostrProfileMetadata | null): string {
-  if (metadata?.display_name?.trim()) return metadata.display_name.trim().slice(0, 2).toUpperCase();
-  if (metadata?.name?.trim()) return metadata.name.trim().slice(0, 2).toUpperCase();
-  if (!auth.pubkey) return 'WG';
-  return auth.pubkey.slice(0, 2).toUpperCase();
-}
-
-function shortPubkey(pubkey: string | null): string {
-  if (!pubkey) return 'Not connected';
-  return `${pubkey.slice(0, 10)}...${pubkey.slice(-8)}`;
-}
-
 export default function HomeScreen() {
   const { width } = useWindowDimensions();
   const isMobile = width < 700;
   const [activePage, setActivePage] = useState<MainPage>('profile');
   const [profileTab, setProfileTab] = useState<ProfileTab>('diary');
+  const [hoveredProfileTab, setHoveredProfileTab] = useState<ProfileTab | null>(null);
+  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>('growmies');
+  const [loginPromptDismissed, setLoginPromptDismissed] = useState(false);
+  const [loginPromptLoaded, setLoginPromptLoaded] = useState(false);
+  const [loginPromptMenuOpen, setLoginPromptMenuOpen] = useState(false);
+  const settingsMenuAnim = useRef(new Animated.Value(0)).current;
 
   const [authState, setAuthState] = useState<AuthState>(authManager.getState());
   const [relayUrls, setRelayUrls] = useState<string[]>(relayManager.getEnabledUrls());
   const [hashtags, setHashtags] = useState<string[]>(DEFAULT_HASHTAGS);
-  const [events, setEvents] = useState<FilteredEvent[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
+  const [feedFilterEnabled, setFeedFilterEnabled] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [currentSubId, setCurrentSubId] = useState<string | null>(null);
 
   const [newRelay, setNewRelay] = useState('');
   const [newHashtag, setNewHashtag] = useState('');
@@ -109,6 +130,16 @@ export default function HomeScreen() {
     features.allowNsecLogin ? 'nsec' : 'npub'
   );
   const [signerAvailable, setSignerAvailable] = useState(authManager.isBrowserSignerAvailable());
+  const [nip46Available, setNip46Available] = useState(authManager.isNip46SignerAvailable());
+  const [nip46BridgePresent, setNip46BridgePresent] = useState(authManager.isNip46BridgePresent());
+  const [nip46PairingInput, setNip46PairingInput] = useState('');
+  const [nip46PairingBusy, setNip46PairingBusy] = useState(false);
+  const [nip46PairingState, setNip46PairingState] = useState<Nip46PairingState>({
+    phase: 'unavailable',
+    connectionUri: null,
+    code: null,
+    message: null,
+  });
 
   const [diaryIdInput, setDiaryIdInput] = useState(defaultDiaryId());
   const [diaryTitleInput, setDiaryTitleInput] = useState('My Grow Run #1');
@@ -118,11 +149,11 @@ export default function HomeScreen() {
   const [diaryPublishing, setDiaryPublishing] = useState(false);
   const [diaryEditMode, setDiaryEditMode] = useState(false);
   const [diarySnapshot, setDiarySnapshot] = useState<DiaryIndex | null>(null);
-  const [chapterMenuForEntry, setChapterMenuForEntry] = useState<string | null>(null);
+  const [diaryPlantInput, setDiaryPlantInput] = useState('');
+  const [diaryPhaseInput, setDiaryPhaseInput] = useState('');
 
   const [profileLoading, setProfileLoading] = useState(false);
   const [profilePosts, setProfilePosts] = useState<NostrRawEvent[]>([]);
-  const [initialFeedLoaded, setInitialFeedLoaded] = useState(false);
   const [profileMetadata, setProfileMetadata] = useState<NostrProfileMetadata | null>(null);
   const [lastSyncedPubkey, setLastSyncedPubkey] = useState<string | null>(null);
 
@@ -134,12 +165,82 @@ export default function HomeScreen() {
   const [addToDiaryTargetId, setAddToDiaryTargetId] = useState<string | null>(null);
   const [growmies, setGrowmies] = useState<string[]>([]);
   const [onlyGrowmies, setOnlyGrowmies] = useState(false);
+  const [feedAuthorNames, setFeedAuthorNames] = useState<Record<string, string>>({});
+  const [profileHashtagFilterEnabled, setProfileHashtagFilterEnabled] = useState(false);
+  const [profileHashtags, setProfileHashtags] = useState<string[]>([]);
+  const [newProfileHashtag, setNewProfileHashtag] = useState('');
+  const {
+    events,
+    isLoading,
+    subscribeFeed,
+    refresh: refreshFeed,
+  } = useFeedController({
+    relayUrls,
+    hashtags,
+    filterEnabled: feedFilterEnabled,
+    onError: setError,
+  });
 
   useEffect(() => {
     setSignerAvailable(authManager.isBrowserSignerAvailable());
+    setNip46Available(authManager.isNip46SignerAvailable());
+    setNip46BridgePresent(authManager.isNip46BridgePresent());
   }, []);
 
-  const hydrateDiaryStateFromStore = async (preferredDiaryId?: string) => {
+  useEffect(() => {
+    let canceled = false;
+    getJson<boolean>(LOGIN_PROMPT_DISMISSED_KEY, false)
+      .then((value) => {
+        if (canceled) return;
+        setLoginPromptDismissed(Boolean(value));
+      })
+      .finally(() => {
+        if (canceled) return;
+        setLoginPromptLoaded(true);
+      });
+    return () => {
+      canceled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    Animated.timing(settingsMenuAnim, {
+      toValue: settingsMenuOpen ? 1 : 0,
+      duration: settingsMenuOpen ? 160 : 120,
+      useNativeDriver: true,
+    }).start();
+  }, [settingsMenuAnim, settingsMenuOpen]);
+
+  const refreshSignerAvailability = useCallback(() => {
+    setSignerAvailable(authManager.isBrowserSignerAvailable());
+    setNip46Available(authManager.isNip46SignerAvailable());
+    setNip46BridgePresent(authManager.isNip46BridgePresent());
+  }, []);
+
+  const persistLoginPromptDismissed = useCallback(async () => {
+    setLoginPromptDismissed(true);
+    await setJson(LOGIN_PROMPT_DISMISSED_KEY, true);
+  }, []);
+
+  const refreshNip46PairingState = useCallback(async () => {
+    const state = await authManager.getNip46PairingState();
+    setNip46PairingState(state);
+  }, []);
+
+  useEffect(() => {
+    refreshNip46PairingState().catch(() => {
+      // best-effort status load
+    });
+  }, [refreshNip46PairingState]);
+
+  useEffect(() => {
+    if (!authState.isLoggedIn || loginPromptDismissed) return;
+    persistLoginPromptDismissed().catch(() => {
+      // best-effort persistence only
+    });
+  }, [authState.isLoggedIn, loginPromptDismissed, persistLoginPromptDismissed]);
+
+  const hydrateDiaryStateFromStore = useCallback(async (preferredDiaryId?: string) => {
     const diaries = diaryStore.listDiaries();
     const options: DiaryRunOption[] = diaries.map((diary) => ({
       diaryId: diary.id,
@@ -161,6 +262,8 @@ export default function HomeScreen() {
       setDiaryEvents({});
       setDiaryIdInput(defaultDiaryId());
       setDiaryTitleInput('My Grow Run #1');
+      setDiaryPlantInput('');
+      setDiaryPhaseInput('');
       return;
     }
 
@@ -168,16 +271,15 @@ export default function HomeScreen() {
     const selected = diaryStore.getDiary(selectedId);
     if (!selected) return;
 
-    const syntheticChapters = DEFAULT_DIARY_CHAPTERS;
     const nextDraft: DiaryIndex = {
       version: 1,
       diaryId: selected.id,
       title: selected.title,
       defaultRelayHints: relayUrls,
-      chapters: syntheticChapters,
+      chapters: [],
       entries: selected.items.map((item) => ({
         id: item.eventId,
-        chapter: syntheticChapters[0].key,
+        chapter: item.phaseLabel || selected.phase || 'General',
         addedAt: item.addedAt,
       })),
     };
@@ -185,6 +287,8 @@ export default function HomeScreen() {
     setDiaryDraft(nextDraft);
     setDiaryIdInput(selected.id);
     setDiaryTitleInput(selected.title);
+    setDiaryPlantInput(selected.plant || '');
+    setDiaryPhaseInput(selected.phase || '');
 
     const localEventFallbacks: Record<string, NostrRawEvent> = {};
     for (const item of selected.items) {
@@ -211,14 +315,14 @@ export default function HomeScreen() {
         setDiaryEvents(fetched);
       }
     }
-  };
+  }, [relayUrls]);
 
-  const hydrateGrowmiesState = () => {
+  const hydrateGrowmiesState = useCallback(() => {
     setGrowmies(growmiesStore.list());
     setOnlyGrowmies(growmiesStore.isOnlyGrowmies());
-  };
+  }, []);
 
-  const syncRelaysAndProfile = async (pubkey: string): Promise<string[]> => {
+  const syncRelaysAndProfile = useCallback(async (pubkey: string): Promise<string[]> => {
     const currentRelays = relayManager.getEnabledUrls();
     const allKnownRelays = relayManager.getAllRelays().map((relay) => relay.url);
     const seedRelays = Array.from(new Set([...currentRelays, ...allKnownRelays])).slice(0, 12);
@@ -231,8 +335,8 @@ export default function HomeScreen() {
         try {
           relayManager.addRelay(relayUrl);
           relayManager.enableRelay(relayUrl);
-        } catch (error) {
-          console.warn('Skipping invalid user relay', relayUrl, error);
+        } catch (relayError) {
+          logger.warn('Skipping invalid user relay', relayUrl, relayError);
         }
       }
     }
@@ -244,9 +348,9 @@ export default function HomeScreen() {
     const metadata = await nostrClient.fetchProfileMetadata(pubkey, mergedRelays, 7000);
     setProfileMetadata(metadata);
     return mergedRelays;
-  };
+  }, []);
 
-  const loadDiary = async (forcedDiaryId?: string) => {
+  const loadDiary = useCallback(async (forcedDiaryId?: string) => {
     if (!authState.pubkey) return;
     setDiaryLoading(true);
     try {
@@ -262,9 +366,9 @@ export default function HomeScreen() {
     } finally {
       setDiaryLoading(false);
     }
-  };
+  }, [authState.pubkey, relayUrls, hydrateDiaryStateFromStore]);
 
-  const loadAuthorPosts = async (relayOverride?: string[]) => {
+  const loadAuthorPosts = useCallback(async (relayOverride?: string[]) => {
     if (!authState.pubkey) return;
     const activeRelays = relayOverride && relayOverride.length > 0 ? relayOverride : relayUrls;
     if (activeRelays.length === 0) return;
@@ -286,7 +390,7 @@ export default function HomeScreen() {
     } finally {
       setProfileLoading(false);
     }
-  };
+  }, [authState.pubkey, relayUrls]);
 
   useEffect(() => {
     if (!authState.isLoggedIn || !authState.pubkey) {
@@ -299,8 +403,12 @@ export default function HomeScreen() {
       setLastSyncedPubkey(null);
       setGrowmies([]);
       setOnlyGrowmies(false);
-      void diaryStore.setUser(null);
-      void growmiesStore.setUser(null);
+      diaryStore.setUser(null).catch(() => {
+        // ignore
+      });
+      growmiesStore.setUser(null).catch(() => {
+        // ignore
+      });
       return;
     }
 
@@ -328,106 +436,16 @@ export default function HomeScreen() {
     loadAuthorPosts().catch((err) => {
       setError(err instanceof Error ? err.message : 'Failed to load profile posts');
     });
-  }, [authState.isLoggedIn, authState.pubkey, relayUrls.join(','), lastSyncedPubkey]);
-
-  const subscribeFeed = async (relayOverride?: string[]) => {
-    try {
-      setIsLoading(true);
-      setError(null);
-
-      const activeRelays = relayOverride && relayOverride.length > 0 ? relayOverride : relayUrls;
-      if (activeRelays.length === 0) {
-        throw new Error('No relays enabled. Please enable at least one relay.');
-      }
-
-      nostrClient.setRelays(activeRelays);
-      if (currentSubId) {
-        nostrClient.unsubscribe(currentSubId);
-      }
-
-      const sevenDaysAgo = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
-      const allEvents: NostrEvent[] = [];
-
-      const tryFallbackLoad = async () => {
-        const fallbackEvents = await nostrClient.fetchRecentPublicNotes(80, 7000);
-        if (fallbackEvents.length > 0) {
-          const filtered = filterAndDeduplicateEvents(fallbackEvents, hashtags);
-          if (filtered.length > 0) {
-            setEvents(filtered);
-          } else {
-            setEvents(deduplicateAndFormatEvents(fallbackEvents));
-          }
-        }
-        setIsLoading(false);
-      };
-
-      const overallTimeout = setTimeout(() => {
-        if (allEvents.length === 0) {
-          void tryFallbackLoad();
-        }
-      }, 10000);
-
-      const subId = await nostrClient.subscribeFeed(
-        hashtags,
-        sevenDaysAgo,
-        (event) => {
-          clearTimeout(overallTimeout);
-          allEvents.push(event);
-
-          const filtered = filterAndDeduplicateEvents(allEvents, hashtags);
-          if (filtered.length > 0) {
-            setEvents(filtered);
-          } else {
-            setEvents(deduplicateAndFormatEvents(allEvents));
-          }
-
-          setIsLoading(false);
-          threadManager.addEvent(event);
-
-          if (activeRelays.length > 0) {
-            reactionManager.fetchReactions([event.id], activeRelays).catch((err) => {
-              console.warn('Failed to fetch reactions:', err);
-            });
-          }
-        },
-        () => {
-          if (allEvents.length === 0) {
-            void tryFallbackLoad();
-          }
-        }
-      );
-
-      setCurrentSubId(subId);
-      setTimeout(() => {
-        if (allEvents.length === 0) {
-          void tryFallbackLoad();
-        } else {
-          setIsLoading(false);
-        }
-      }, 3000);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to subscribe to feed');
-      setIsLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    return () => {
-      if (currentSubId) {
-        nostrClient.unsubscribe(currentSubId);
-      }
-    };
-  }, [currentSubId]);
-
-  useEffect(() => {
-    if (initialFeedLoaded) return;
-    if (relayUrls.length === 0) return;
-
-    setInitialFeedLoaded(true);
-    subscribeFeed().catch((err) => {
-      setError(err instanceof Error ? err.message : 'Failed to load initial feed');
-    });
-  }, [relayUrls.join(','), initialFeedLoaded]);
+  }, [
+    authState.isLoggedIn,
+    authState.pubkey,
+    relayUrls,
+    lastSyncedPubkey,
+    syncRelaysAndProfile,
+    loadDiary,
+    hydrateGrowmiesState,
+    loadAuthorPosts,
+  ]);
 
   const openAddToDiaryModal = (event: NostrRawEvent) => {
     if (!authState.isLoggedIn || !authState.pubkey) {
@@ -450,6 +468,7 @@ export default function HomeScreen() {
     try {
       let targetId = addToDiaryTargetId;
       if (!targetId && newDiaryInlineTitle.trim()) {
+        assertNoSensitiveMaterial(newDiaryInlineTitle.trim(), 'new diary title');
         const created = await diaryStore.createDiary(newDiaryInlineTitle.trim(), false);
         targetId = created.id;
       }
@@ -459,7 +478,7 @@ export default function HomeScreen() {
         return;
       }
 
-      await diaryStore.addItemToDiary(targetId, addToDiaryEvent);
+      await diaryStore.addItemToDiary(targetId, addToDiaryEvent, diaryPhaseInput.trim() || undefined);
       await hydrateDiaryStateFromStore(targetId);
       setAddToDiaryModalOpen(false);
       setAddToDiaryEvent(null);
@@ -508,18 +527,14 @@ export default function HomeScreen() {
   const updateEntryChapter = (entryId: string, nextChapter: string) => {
     if (!diaryDraft) return;
 
-    const nextChapters = diaryDraft.chapters.some((item) => item.key === nextChapter)
-      ? diaryDraft.chapters
-      : [...diaryDraft.chapters, { key: nextChapter, label: nextChapter }];
-
     const nextDraft: DiaryIndex = {
       ...diaryDraft,
-      chapters: nextChapters,
+      chapters: [],
       entries: diaryDraft.entries.map((entry) =>
         entry.id === entryId
           ? {
               ...entry,
-              chapter: nextChapter,
+              chapter: nextChapter.trim() || 'General',
             }
           : entry
       ),
@@ -535,7 +550,20 @@ export default function HomeScreen() {
     }
     setDiaryPublishing(true);
     try {
-      await diaryStore.renameDiary(diaryDraft.diaryId, diaryTitleInput);
+      assertNoSensitiveMaterial(diaryTitleInput, 'diary title');
+      await diaryStore.updateDiaryDetails(diaryDraft.diaryId, {
+        title: diaryTitleInput,
+        plant: diaryPlantInput,
+        phase: diaryPhaseInput,
+      });
+      await diaryStore.setDiaryItemOrder(
+        diaryDraft.diaryId,
+        diaryDraft.entries.map((entry) => entry.id)
+      );
+      const labelsByEventId = Object.fromEntries(
+        diaryDraft.entries.map((entry) => [entry.id, entry.chapter || 'General'])
+      );
+      await diaryStore.setDiaryItemPhaseLabels(diaryDraft.diaryId, labelsByEventId);
       await diaryStore.setDiaryPublic(diaryDraft.diaryId, true);
       await diaryStore.syncPublicDiary(diaryDraft.diaryId, authState, relayUrls);
       await hydrateDiaryStateFromStore(diaryDraft.diaryId);
@@ -561,7 +589,6 @@ export default function HomeScreen() {
     }
     setDiarySnapshot(null);
     setDiaryEditMode(false);
-    setChapterMenuForEntry(null);
   };
 
   const handleCreateDiary = async () => {
@@ -569,7 +596,11 @@ export default function HomeScreen() {
       setError('Login required');
       return;
     }
-    const created = await diaryStore.createDiary(`My Grow Run #${runOptions.length + 1}`, false);
+    const proposedTitle = diaryTitleInput.trim() || `My Grow Run #${runOptions.length + 1}`;
+    const created = await diaryStore.createDiary(proposedTitle, false, {
+      plant: diaryPlantInput,
+      phase: diaryPhaseInput,
+    });
     await hydrateDiaryStateFromStore(created.id);
     setDiaryEditMode(true);
     const selected = diaryStore.getDiary(created.id);
@@ -581,11 +612,25 @@ export default function HomeScreen() {
             diaryId: selected.id,
             title: selected.title,
             defaultRelayHints: relayUrls,
-            chapters: DEFAULT_DIARY_CHAPTERS,
+            chapters: [],
             entries: [],
           })
         ) as DiaryIndex
       );
+    }
+  };
+
+  const handleOpenDiaryEditor = async () => {
+    if (!authState.pubkey) {
+      setError('Login required');
+      return;
+    }
+    if (!diaryDraft) {
+      await handleCreateDiary();
+      return;
+    }
+    if (!diaryEditMode) {
+      handleStartEdit();
     }
   };
 
@@ -613,7 +658,8 @@ export default function HomeScreen() {
       setAuthState(newState);
       setNsecInput('');
       setNpubInput('');
-      setSignerAvailable(authManager.isBrowserSignerAvailable());
+      refreshSignerAvailability();
+      await refreshNip46PairingState();
       if (newState.pubkey) {
         const syncedRelays = await syncRelaysAndProfile(newState.pubkey);
         await Promise.all([subscribeFeed(syncedRelays), loadAuthorPosts(syncedRelays)]);
@@ -626,16 +672,89 @@ export default function HomeScreen() {
   const handleConnectSigner = async () => {
     try {
       setError(null);
-      await authManager.loginWithBrowserSigner();
+      await authManager.loginWithSignerFirst();
       const newState = authManager.getState();
       setAuthState(newState);
-      setSignerAvailable(authManager.isBrowserSignerAvailable());
+      refreshSignerAvailability();
+      await refreshNip46PairingState();
       if (newState.pubkey) {
         const syncedRelays = await syncRelaysAndProfile(newState.pubkey);
         await Promise.all([subscribeFeed(syncedRelays), loadAuthorPosts(syncedRelays)]);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to connect signer');
+    }
+  };
+
+  const handleConnectNip46 = async () => {
+    try {
+      setError(null);
+      await authManager.connectNip46Session();
+      const newState = authManager.getState();
+      setAuthState(newState);
+      refreshSignerAvailability();
+      await refreshNip46PairingState();
+      if (newState.pubkey) {
+        const syncedRelays = await syncRelaysAndProfile(newState.pubkey);
+        await Promise.all([subscribeFeed(syncedRelays), loadAuthorPosts(syncedRelays)]);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to connect NIP-46');
+    }
+  };
+
+  const handleDisconnectNip46 = async () => {
+    try {
+      setError(null);
+      await authManager.disconnectNip46Session();
+      setAuthState(authManager.getState());
+      refreshSignerAvailability();
+      await refreshNip46PairingState();
+      setDiaryEditMode(false);
+      setProfileMetadata(null);
+      setLastSyncedPubkey(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to disconnect NIP-46');
+    }
+  };
+
+  const handleStartNip46Pairing = async () => {
+    try {
+      setError(null);
+      setNip46PairingBusy(true);
+      const state = await authManager.startNip46Pairing(nip46PairingInput);
+      setNip46PairingState(state);
+      refreshSignerAvailability();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to start NIP-46 pairing');
+    } finally {
+      setNip46PairingBusy(false);
+    }
+  };
+
+  const handleApproveNip46Pairing = async () => {
+    try {
+      setError(null);
+      setNip46PairingBusy(true);
+      const state = await authManager.approveNip46Pairing();
+      setNip46PairingState(state);
+      refreshSignerAvailability();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to approve NIP-46 pairing');
+    } finally {
+      setNip46PairingBusy(false);
+    }
+  };
+
+  const handleRefreshNip46Pairing = async () => {
+    try {
+      setNip46PairingBusy(true);
+      await refreshNip46PairingState();
+      refreshSignerAvailability();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to refresh NIP-46 pairing status');
+    } finally {
+      setNip46PairingBusy(false);
     }
   };
 
@@ -650,6 +769,8 @@ export default function HomeScreen() {
   const handleLogout = async () => {
     await authManager.logout();
     setAuthState(authManager.getState());
+    refreshSignerAvailability();
+    await refreshNip46PairingState();
     setDiaryEditMode(false);
     setProfileMetadata(null);
     setLastSyncedPubkey(null);
@@ -699,32 +820,69 @@ export default function HomeScreen() {
     setHashtags(hashtags.filter((h) => h !== tag));
   };
 
-  const handleRefresh = () => {
-    setEvents([]);
-    subscribeFeed().catch((err) => {
-      setError(err instanceof Error ? err.message : 'Failed to refresh feed');
-    });
+  const handleResetDefaultHashtags = () => {
+    setHashtags(DEFAULT_HASHTAGS);
+    setFeedFilterEnabled(true);
   };
 
-  const groupedDiary = useMemo(() => {
-    if (!diaryDraft) return [] as Array<{ chapter: string; label: string; entries: DiaryEntry[] }>;
-
-    const chapterLabelMap = new Map(diaryDraft.chapters.map((chapter) => [chapter.key, chapter.label]));
-    const groups = new Map<string, DiaryEntry[]>();
-
-    for (const entry of diaryDraft.entries) {
-      if (!groups.has(entry.chapter)) {
-        groups.set(entry.chapter, []);
-      }
-      groups.get(entry.chapter)!.push(entry);
+  const handleAddProfileHashtag = () => {
+    const tag = newProfileHashtag.trim().toLowerCase().replace(/^#+/, '');
+    if (!tag) return;
+    if (!profileHashtags.includes(tag)) {
+      setProfileHashtags((prev) => [...prev, tag]);
     }
+    setNewProfileHashtag('');
+  };
 
-    return Array.from(groups.entries()).map(([chapter, entriesInChapter]) => ({
-      chapter,
-      label: chapterLabelMap.get(chapter) || chapter,
-      entries: entriesInChapter,
-    }));
-  }, [diaryDraft]);
+  const handleRemoveProfileHashtag = (tag: string) => {
+    setProfileHashtags((prev) => prev.filter((item) => item !== tag));
+  };
+
+  const handleRefresh = () => {
+    setError(null);
+    refreshFeed();
+  };
+
+  const persistDiaryDetails = useCallback(async () => {
+    if (!diaryDraft) return;
+    try {
+      await diaryStore.updateDiaryDetails(diaryDraft.diaryId, {
+        title: diaryTitleInput,
+        plant: diaryPlantInput,
+        phase: diaryPhaseInput,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save diary details');
+    }
+  }, [diaryDraft, diaryTitleInput, diaryPlantInput, diaryPhaseInput]);
+
+  const feedHashtagsKey = useMemo(() => hashtags.join('|'), [hashtags]);
+  useEffect(() => {
+    if (relayUrls.length === 0) return;
+    refreshFeed();
+  }, [feedFilterEnabled, feedHashtagsKey, refreshFeed, relayUrls.length]);
+
+  const groupedDiary = useMemo(() => groupDiaryEntries(diaryDraft), [diaryDraft]);
+  const selectedDiary = useMemo(
+    () => (diaryDraft ? diaryStore.getDiary(diaryDraft.diaryId) : null),
+    [diaryDraft]
+  );
+  const diaryItemById = useMemo(
+    () => new Map((selectedDiary?.items || []).map((item) => [item.eventId, item])),
+    [selectedDiary]
+  );
+  const selectedDiaryCoverImage = useMemo(() => {
+    if (selectedDiary?.coverImage) return selectedDiary.coverImage;
+    return selectedDiary?.items.find((item) => !!item.image)?.image;
+  }, [selectedDiary]);
+  const nostrSinceLabel = useMemo(() => {
+    if (!authState.pubkey) return 'Unknown';
+    const timestamps = profilePosts.map((post) => post.created_at).filter((v) => Number.isFinite(v) && v > 0);
+    if (timestamps.length === 0) return 'Unknown';
+    const oldest = Math.min(...timestamps);
+    const date = new Date(oldest * 1000);
+    return date.toLocaleDateString(undefined, { month: 'short', year: 'numeric' });
+  }, [authState.pubkey, profilePosts]);
 
   const selectedRunTitle =
     runOptions.find((run) => run.diaryId === diaryIdInput)?.title ||
@@ -734,6 +892,14 @@ export default function HomeScreen() {
 
   const selectedRunSyncStatus =
     runOptions.find((run) => run.diaryId === diaryIdInput)?.syncStatus || 'local-only';
+  const profilePubkeyText = authState.pubkey
+    ? authState.pubkey.match(/.{1,16}/g)?.join('\n') || authState.pubkey
+    : shortPubkey(authState.pubkey);
+  const nip46PhaseLabel = nip46PairingState.phase.toUpperCase();
+  const isReadOnlyBlocked = authState.isLoggedIn && authState.isReadOnly;
+  const readOnlyBlockHint = isReadOnlyBlocked
+    ? 'Read-only mode: connect signer or nsec local signer to publish.'
+    : null;
 
   const visibleFeedEvents = useMemo(() => {
     if (!onlyGrowmies) return events;
@@ -742,112 +908,197 @@ export default function HomeScreen() {
     return events.filter((event) => allowed.has(event.author));
   }, [events, onlyGrowmies, growmies]);
 
-  const renderTopNavigation = () => (
-    <View style={styles.navRow}>
-      <TouchableOpacity
-        style={styles.navLink}
-        onPress={() => setActivePage('feed')}
-      >
-        <Text style={[styles.navLinkText, activePage === 'feed' && styles.navLinkTextActive]}>Feed</Text>
-        <View style={[styles.navLinkUnderline, activePage === 'feed' && styles.navLinkUnderlineActive]} />
-      </TouchableOpacity>
-      <TouchableOpacity
-        style={styles.navLink}
-        onPress={() => setActivePage('profile')}
-      >
-        <Text style={[styles.navLinkText, activePage === 'profile' && styles.navLinkTextActive]}>Profile</Text>
-        <View style={[styles.navLinkUnderline, activePage === 'profile' && styles.navLinkUnderlineActive]} />
-      </TouchableOpacity>
-      <TouchableOpacity
-        style={styles.navLink}
-        onPress={() => setActivePage('settings')}
-      >
-        <Text style={[styles.navLinkText, activePage === 'settings' && styles.navLinkTextActive]}>Settings</Text>
-        <View style={[styles.navLinkUnderline, activePage === 'settings' && styles.navLinkUnderlineActive]} />
-      </TouchableOpacity>
-      <TouchableOpacity
-        style={styles.navLink}
-        onPress={() => setActivePage('growmies')}
-      >
-        <Text style={[styles.navLinkText, activePage === 'growmies' && styles.navLinkTextActive]}>Growmies</Text>
-        <View style={[styles.navLinkUnderline, activePage === 'growmies' && styles.navLinkUnderlineActive]} />
-      </TouchableOpacity>
+  const visibleProfilePosts = useMemo(() => {
+    if (!profileHashtagFilterEnabled || profileHashtags.length === 0) {
+      return profilePosts;
+    }
+    const selected = new Set(profileHashtags.map((tag) => tag.toLowerCase()));
+    return profilePosts.filter((post) => {
+      const tags = getAllHashtags(post as any);
+      return tags.some((tag) => selected.has(tag.toLowerCase()));
+    });
+  }, [profileHashtagFilterEnabled, profileHashtags, profilePosts]);
+
+  const growmiesFeedEvents = useMemo(() => {
+    if (growmies.length === 0) return [];
+    const allowed = new Set(growmies);
+    return events.filter((event) => allowed.has(event.author));
+  }, [events, growmies]);
+
+  const renderFeedEventCard = (event: typeof events[number], allowAddToGrowmies: boolean) => (
+    <View key={event.id} style={styles.feedItem}>
+      <View style={styles.feedItemHeader}>
+        <View style={styles.feedAuthorAvatar}>
+          <Text style={styles.feedAuthorAvatarText}>
+            {(feedAuthorNames[event.author] || shortPubkey(event.author)).slice(0, 1).toUpperCase()}
+          </Text>
+        </View>
+        <View style={styles.feedAuthorMeta}>
+          <Text style={styles.author}>
+            {feedAuthorNames[event.author] || shortPubkey(event.author)}
+          </Text>
+          <Text style={styles.timestamp}>{event.timestamp}</Text>
+        </View>
+      </View>
+      <PostMediaRenderer content={event.content} tags={event.tags} textNumberOfLines={5} />
+      <View style={styles.tagsContainer}>
+        {event.hashtags.map((tag) => (
+          <Text key={tag} style={styles.tag}>
+            #{tag}
+          </Text>
+        ))}
+      </View>
+
+      <ReactionBar
+        eventId={event.id}
+        eventAuthor={event.author}
+        authState={authState}
+        relayUrls={relayUrls}
+        onReactionAdded={() => {
+          setTimeout(() => {
+            const eventIds = events.map((e) => e.id);
+            reactionManager.fetchReactions(eventIds, relayUrls).catch((err) => {
+              logger.warn('Failed to refresh reactions:', err);
+            });
+          }, 500);
+        }}
+      />
+
+      <ThreadIndicator eventId={event.id} />
+
+      {authState.isLoggedIn && (
+        <TouchableOpacity
+          style={styles.addToDiaryMini}
+          onPress={() => openAddToDiaryModal(event as unknown as NostrRawEvent)}
+        >
+          <Text style={styles.addToDiaryMiniText}>Add to Diary</Text>
+        </TouchableOpacity>
+      )}
+      {allowAddToGrowmies && authState.isLoggedIn && event.author !== authState.pubkey && !growmies.includes(event.author) && (
+        <TouchableOpacity style={styles.addToDiaryMini} onPress={() => handleAddToGrowmies(event.author)}>
+          <Text style={styles.addToDiaryMiniText}>Add to Growmies</Text>
+        </TouchableOpacity>
+      )}
     </View>
   );
 
+  useEffect(() => {
+    if (relayUrls.length === 0 || visibleFeedEvents.length === 0) return;
+
+    const missingAuthors = Array.from(
+      new Set(visibleFeedEvents.map((event) => event.author).filter((author) => !feedAuthorNames[author]))
+    ).slice(0, 12);
+
+    if (missingAuthors.length === 0) return;
+
+    let canceled = false;
+    Promise.all(
+      missingAuthors.map(async (author) => {
+        const metadata = await nostrClient.fetchProfileMetadata(author, relayUrls, 2500);
+        const label = metadata?.display_name?.trim() || metadata?.name?.trim() || '';
+        return { author, label };
+      })
+    )
+      .then((resolved) => {
+        if (canceled) return;
+        setFeedAuthorNames((prev) => {
+          const next = { ...prev };
+          for (const item of resolved) {
+            if (item.label) {
+              next[item.author] = item.label;
+            }
+          }
+          return next;
+        });
+      })
+      .catch(() => {
+        // best effort only
+      });
+
+    return () => {
+      canceled = true;
+    };
+  }, [visibleFeedEvents, relayUrls, feedAuthorNames]);
+
   const renderFeedPage = () => (
     <View style={styles.pageContainer}>
-      <View style={[styles.pageInner, isMobile && styles.pageInnerMobile]}>
-      <View style={styles.panel}>
-        <View style={styles.feedHeader}>
-          <Text style={styles.panelTitle}>Weed Feed</Text>
-          <TouchableOpacity style={styles.smallButton} onPress={handleRefresh}>
-            <Text style={styles.buttonText}>Refresh</Text>
-          </TouchableOpacity>
-        </View>
-
-        {isLoading && (
-          <View style={styles.centerContent}>
-            <ActivityIndicator size="large" color="#059669" />
-            <Text style={styles.loadingText}>Loading feed...</Text>
-          </View>
-        )}
-
-        {!isLoading && visibleFeedEvents.length === 0 && relayUrls.length > 0 && (
-          <View style={styles.centerContent}>
-            <Text style={styles.emptyText}>
-              {onlyGrowmies ? 'No posts from Growmies yet.' : 'No posts yet.'}
-            </Text>
-          </View>
-        )}
-
-        {visibleFeedEvents.map((event) => (
-          <View key={event.id} style={styles.feedItem}>
-            <Text style={styles.author}>{event.author.substring(0, 12)}...</Text>
-            <Text style={styles.timestamp}>{event.timestamp}</Text>
-            <PostMediaRenderer content={event.content} tags={event.tags} textNumberOfLines={5} />
-            <View style={styles.tagsContainer}>
-              {event.hashtags.map((tag) => (
-                <Text key={tag} style={styles.tag}>
-                  {tag}
-                </Text>
-              ))}
+      <ScrollView style={styles.scrollContent} showsVerticalScrollIndicator={false}>
+        <View style={[styles.pageInner, isMobile && styles.pageInnerMobile]}>
+          <View style={styles.panel}>
+            <View style={styles.feedHeader}>
+              <Text style={styles.panelTitle}>Decentralized Farmers</Text>
+              <TouchableOpacity style={styles.smallButton} onPress={handleRefresh}>
+                <Text style={styles.buttonText}>Refresh</Text>
+              </TouchableOpacity>
             </View>
 
-            <ReactionBar
-              eventId={event.id}
-              eventAuthor={event.author}
-              authState={authState}
-              relayUrls={relayUrls}
-              onReactionAdded={() => {
-                setTimeout(() => {
-                  const eventIds = events.map((e) => e.id);
-                  reactionManager.fetchReactions(eventIds, relayUrls).catch((err) => {
-                    console.warn('Failed to refresh reactions:', err);
-                  });
-                }, 500);
-              }}
-            />
-
-            <ThreadIndicator eventId={event.id} />
-
-            {authState.isLoggedIn && (
-              <TouchableOpacity
-                style={styles.addToDiaryMini}
-                onPress={() => openAddToDiaryModal(event as unknown as NostrRawEvent)}
-              >
-                <Text style={styles.addToDiaryMiniText}>Add to Diary</Text>
-              </TouchableOpacity>
-            )}
-            {authState.isLoggedIn && event.author !== authState.pubkey && !growmies.includes(event.author) && (
-              <TouchableOpacity style={styles.addToDiaryMini} onPress={() => handleAddToGrowmies(event.author)}>
-                <Text style={styles.addToDiaryMiniText}>Add to Growmies</Text>
-              </TouchableOpacity>
-            )}
+            <View style={styles.feedFilterCard}>
+              <View style={styles.feedFilterHeader}>
+                <Text style={styles.feedFilterTitle}>Hashtag filter</Text>
+                <TouchableOpacity
+                  style={[styles.filterToggleBtn, !feedFilterEnabled && styles.filterToggleBtnMuted]}
+                  onPress={() => setFeedFilterEnabled((prev) => !prev)}
+                >
+                  <Text style={styles.filterToggleBtnText}>
+                    {feedFilterEnabled ? 'Filtering ON' : 'Filtering OFF'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+              {feedFilterEnabled ? (
+                <>
+                  <Text style={styles.signerHint}>
+                    Default load uses #weedstr + #plantstr and includes older notes.
+                  </Text>
+                  <View style={styles.hashtagContainer}>
+                    {hashtags.map((tag) => (
+                      <View key={tag} style={styles.hashtagBadge}>
+                        <Text style={styles.hashtagText}>#{tag}</Text>
+                        <TouchableOpacity onPress={() => handleRemoveHashtag(tag)}>
+                          <Text style={styles.removeBtn}>✕</Text>
+                        </TouchableOpacity>
+                      </View>
+                    ))}
+                  </View>
+                  <View style={styles.inputGroup}>
+                    <TextInput
+                      style={[styles.input, styles.flexInput]}
+                      placeholder="Add hashtag"
+                      placeholderTextColor="#999"
+                      value={newHashtag}
+                      onChangeText={setNewHashtag}
+                    />
+                    <TouchableOpacity style={styles.smallButton} onPress={handleAddHashtag}>
+                      <Text style={styles.buttonText}>Add</Text>
+                    </TouchableOpacity>
+                  </View>
+                  <TouchableOpacity style={styles.buttonSecondary} onPress={handleResetDefaultHashtags}>
+                    <Text style={styles.buttonText}>Reset to #weedstr + #plantstr</Text>
+                  </TouchableOpacity>
+                </>
+              ) : (
+                <Text style={styles.signerHint}>Feed runs without hashtag filtering.</Text>
+              )}
+            </View>
           </View>
-        ))}
-      </View>
-      </View>
+
+          {isLoading && (
+            <View style={styles.centerContent}>
+              <ActivityIndicator size="large" color="#059669" />
+              <Text style={styles.loadingText}>Loading feed...</Text>
+            </View>
+          )}
+
+          {!isLoading && visibleFeedEvents.length === 0 && relayUrls.length > 0 && (
+            <View style={styles.centerContent}>
+              <Text style={styles.emptyText}>
+                {onlyGrowmies ? 'No posts from Growmies yet.' : 'No posts yet.'}
+              </Text>
+            </View>
+          )}
+
+          {visibleFeedEvents.map((event) => renderFeedEventCard(event, true))}
+        </View>
+      </ScrollView>
     </View>
   );
 
@@ -861,99 +1112,256 @@ export default function HomeScreen() {
         <View style={[styles.pageInner, isMobile && styles.pageInnerMobile]}>
         {!authState.isLoggedIn && (
           <View style={styles.infoBox}>
-            <Text style={styles.infoText}>Login in Settings to manage your profile and diary.</Text>
+            <Text style={styles.infoText}>Use the green Login button to connect Alby, or continue as anon.</Text>
           </View>
         )}
 
-        <View style={styles.profileHeaderCard}>
-          {profileMetadata?.banner ? (
-            <Image source={{ uri: profileMetadata.banner }} style={styles.profileBannerImage} resizeMode="cover" />
-          ) : (
-            <View style={styles.profileBannerFallback} />
-          )}
-          <View style={styles.profileHeaderRow}>
-            <View style={[styles.avatarCircle, isMobile && styles.avatarCircleMobile]}>
-              {profileMetadata?.picture ? (
-                <Image
-                  source={{ uri: profileMetadata.picture }}
-                  style={[styles.avatarImage, isMobile && styles.avatarImageMobile]}
-                  resizeMode="cover"
-                />
-              ) : (
-                <Text style={styles.avatarLabel}>{getAvatarLabel(authState, profileMetadata)}</Text>
-              )}
-            </View>
-            <View style={styles.profileMeta}>
-              <Text style={styles.profileName}>{getDisplayName(authState, profileMetadata)}</Text>
-              <Text style={styles.profilePubkey}>{shortPubkey(authState.pubkey)}</Text>
-              {profileMetadata?.about ? (
-                <Text style={styles.profileBio} numberOfLines={2}>
-                  {profileMetadata.about}
-                </Text>
-              ) : null}
-            </View>
+        <View style={[styles.profileHeaderCard, isMobile && styles.profileHeaderCardMobile]}>
+          <View style={[styles.profileBannerWrap, isMobile && styles.profileBannerWrapMobile]}>
+            {profileMetadata?.banner ? (
+              <Image source={{ uri: profileMetadata.banner }} style={styles.profileBannerImage} resizeMode="cover" />
+            ) : (
+              <View style={styles.profileBannerFallback} />
+            )}
+            <View pointerEvents="none" style={styles.profileBannerOverlayTop} />
+            <View pointerEvents="none" style={styles.profileBannerOverlayBottom} />
           </View>
 
-          <View style={styles.runSelectorRow}>
-            <TouchableOpacity style={styles.runSelectorButton} onPress={() => setRunMenuOpen((prev) => !prev)}>
-              <Text style={styles.runSelectorText}>
-                {selectedRunTitle} ({runOptions.find((run) => run.diaryId === diaryIdInput)?.itemCount ?? 0})
-              </Text>
-              <Text style={styles.runSelectorChevron}>{runMenuOpen ? '▲' : '▼'}</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.ghostButton}
-              onPress={diaryEditMode ? handleCancelEdit : handleStartEdit}
-              disabled={!diaryDraft}
-            >
-              <Text style={styles.ghostButtonText}>Edit diary</Text>
-            </TouchableOpacity>
-          </View>
-          <View style={styles.syncBadgeRow}>
-            <Text style={styles.syncBadgeText}>Sync: {selectedRunSyncStatus}</Text>
-          </View>
-            {runMenuOpen && runOptions.length > 0 && (
-              <View style={styles.runMenu}>
-                {runOptions.map((run) => (
-                  <TouchableOpacity
-                    key={run.diaryId}
-                    style={styles.runMenuItem}
-                    onPress={() => handleSelectRun(run)}
-                  >
-                    <Text style={styles.runMenuText}>
-                      {run.title} • {run.syncStatus} • {run.itemCount} items
-                    </Text>
-                  </TouchableOpacity>
-                ))}
+          <View style={[styles.profileHeaderContent, isMobile && styles.profileHeaderContentMobile]}>
+            <View style={[styles.profileHeaderRow, isMobile && styles.profileHeaderRowMobile]}>
+              <TouchableOpacity
+                style={[styles.avatarCircle, isMobile && styles.avatarCircleMobile]}
+                onPress={() => setActivePage('profile')}
+                accessibilityRole="button"
+                accessibilityLabel="Profile"
+              >
+                {profileMetadata?.picture ? (
+                  <Image
+                    source={{ uri: profileMetadata.picture }}
+                    style={[styles.avatarImage, isMobile && styles.avatarImageMobile]}
+                    resizeMode="cover"
+                  />
+                ) : (
+                  <Text style={styles.avatarLabel}>{getAvatarLabel(authState, profileMetadata)}</Text>
+                )}
+              </TouchableOpacity>
+              <View style={styles.profileMeta}>
+                <View style={styles.profileNameRow}>
+                  <Text style={styles.profileName}>{getDisplayName(authState, profileMetadata)}</Text>
+                </View>
+                <Text style={styles.profilePubkey}>{profilePubkeyText}</Text>
+                {profileMetadata?.about ? (
+                  <Text style={styles.profileBio}>
+                    {profileMetadata.about}
+                  </Text>
+                ) : null}
+                <View style={styles.profileStatsRow}>
+                  <View style={styles.profileStatPill}>
+                    <Text style={styles.profileStatValue}>{runOptions.length}</Text>
+                    <Text style={styles.profileStatLabel}>Diaries</Text>
+                  </View>
+                  <View style={styles.profileStatPill}>
+                    <Text style={styles.profileStatValue}>{profilePosts.length}</Text>
+                    <Text style={styles.profileStatLabel}>Notes</Text>
+                  </View>
+                  <View style={styles.profileStatPill}>
+                    <Text style={styles.profileStatValue}>{growmies.length}</Text>
+                    <Text style={styles.profileStatLabel}>Growmies</Text>
+                  </View>
+                  <View style={styles.profileStatPill}>
+                    <Text style={styles.profileStatValue}>{nostrSinceLabel}</Text>
+                    <Text style={styles.profileStatLabel}>Nostr since</Text>
+                  </View>
+                </View>
+              </View>
+            </View>
+
+            {selectedDiary && (
+              <View style={styles.diaryCoverHero}>
+                {selectedDiaryCoverImage ? (
+                  <Image source={{ uri: selectedDiaryCoverImage }} style={styles.diaryCoverHeroImage} resizeMode="cover" />
+                ) : (
+                  <View style={styles.diaryCoverHeroFallback}>
+                    <Text style={styles.diaryCoverHeroFallbackText}>No cover image</Text>
+                  </View>
+                )}
+                <View style={styles.diaryCoverHeroMeta}>
+                  <Text style={styles.diaryCoverHeroTitle}>{selectedDiary.title}</Text>
+                  <Text style={styles.diaryCoverHeroSubtitle}>
+                    {(selectedDiary.plant || 'Plant not set')} • {(selectedDiary.phase || 'Phase not set')}
+                  </Text>
+                </View>
               </View>
             )}
-          <View style={styles.profileTabs}>
-            <TouchableOpacity
-              style={styles.profileTab}
-              onPress={() => setProfileTab('diary')}
-            >
-              <Text style={[styles.profileTabText, profileTab === 'diary' && styles.profileTabTextActive]}>Diary</Text>
-              <View
+
+            <View style={styles.diaryHeaderActions}>
+              <TouchableOpacity
+                style={styles.smallButton}
+                onPress={() => {
+                  handleOpenDiaryEditor().catch((err) => {
+                    setError(err instanceof Error ? err.message : 'Failed to open diary editor');
+                  });
+                }}
+                disabled={authState.isReadOnly}
+              >
+                <Text style={styles.buttonText}>Add diary</Text>
+              </TouchableOpacity>
+              {diaryEditMode && (
+                <TouchableOpacity style={styles.ghostButton} onPress={handleCancelEdit}>
+                  <Text style={styles.ghostButtonText}>Close editor</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+            {diaryEditMode && (
+              <>
+                <View style={styles.runSelectorRow}>
+                  <TouchableOpacity style={styles.runSelectorButton} onPress={() => setRunMenuOpen((prev) => !prev)}>
+                    <Text style={styles.runSelectorText}>
+                      {selectedRunTitle} ({runOptions.find((run) => run.diaryId === diaryIdInput)?.itemCount ?? 0})
+                    </Text>
+                    <Text style={styles.runSelectorChevron}>{runMenuOpen ? '▲' : '▼'}</Text>
+                  </TouchableOpacity>
+                </View>
+                <View style={styles.diaryDetailsWrap}>
+                  <View style={styles.diaryDetailField}>
+                    <Text style={styles.diaryDetailLabel}>Diary name</Text>
+                    <TextInput
+                      style={styles.diaryDetailInput}
+                      value={diaryTitleInput}
+                      onChangeText={setDiaryTitleInput}
+                      onBlur={() => {
+                        persistDiaryDetails().catch(() => {
+                          // error handled in callback
+                        });
+                      }}
+                      placeholder="My Plant Journal"
+                      placeholderTextColor="#9ca3af"
+                    />
+                  </View>
+                  <View style={styles.diaryDetailRow}>
+                    <View style={[styles.diaryDetailField, styles.diaryDetailFieldHalf]}>
+                      <Text style={styles.diaryDetailLabel}>Plant</Text>
+                      <TextInput
+                        style={styles.diaryDetailInput}
+                        value={diaryPlantInput}
+                        onChangeText={setDiaryPlantInput}
+                        onBlur={() => {
+                          persistDiaryDetails().catch(() => {
+                            // error handled in callback
+                          });
+                        }}
+                        placeholder="e.g. Blue Dream"
+                        placeholderTextColor="#9ca3af"
+                      />
+                    </View>
+                    <View style={[styles.diaryDetailField, styles.diaryDetailFieldHalf]}>
+                      <Text style={styles.diaryDetailLabel}>Phase</Text>
+                      <TextInput
+                        style={styles.diaryDetailInput}
+                        value={diaryPhaseInput}
+                        onChangeText={setDiaryPhaseInput}
+                        onBlur={() => {
+                          persistDiaryDetails().catch(() => {
+                            // error handled in callback
+                          });
+                        }}
+                        placeholder="e.g. Seedling / Vegetation Week 3"
+                        placeholderTextColor="#9ca3af"
+                      />
+                      <View style={styles.phaseTemplatesRow}>
+                        {PHASE_TEMPLATE_OPTIONS.map((template) => (
+                          <TouchableOpacity
+                            key={template}
+                            style={[
+                              styles.phaseTemplateChip,
+                              diaryPhaseInput.trim().toLowerCase().startsWith(template.toLowerCase()) &&
+                                styles.phaseTemplateChipActive,
+                            ]}
+                            onPress={() => {
+                              setDiaryPhaseInput(template);
+                              if (!diaryDraft) return;
+                              diaryStore
+                                .updateDiaryDetails(diaryDraft.diaryId, { phase: template })
+                                .catch((err) =>
+                                  setError(err instanceof Error ? err.message : 'Failed to save diary phase')
+                                );
+                            }}
+                          >
+                            <Text
+                              style={[
+                                styles.phaseTemplateChipText,
+                                diaryPhaseInput.trim().toLowerCase().startsWith(template.toLowerCase()) &&
+                                  styles.phaseTemplateChipTextActive,
+                              ]}
+                            >
+                              {template}
+                            </Text>
+                          </TouchableOpacity>
+                        ))}
+                      </View>
+                    </View>
+                  </View>
+                </View>
+                <View style={styles.syncBadgeRow}>
+                  <Text style={styles.syncBadgeText}>Sync: {selectedRunSyncStatus}</Text>
+                </View>
+                {runMenuOpen && runOptions.length > 0 && (
+                  <View style={styles.runMenu}>
+                    {runOptions.map((run) => (
+                      <TouchableOpacity
+                        key={run.diaryId}
+                        style={styles.runMenuItem}
+                        onPress={() => handleSelectRun(run)}
+                      >
+                        <Text style={styles.runMenuText}>
+                          {run.title} • {run.syncStatus} • {run.itemCount} items
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                )}
+              </>
+            )}
+            <View style={styles.profileTabs}>
+              <Pressable
                 style={[
-                  styles.profileTabUnderline,
-                  profileTab === 'diary' && styles.profileTabUnderlineActive,
+                  styles.profileTab,
+                  hoveredProfileTab === 'diary' && styles.profileTabHover,
+                  profileTab === 'diary' && styles.profileTabActive,
                 ]}
-              />
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.profileTab}
-              onPress={() => setProfileTab('all')}
-            >
-              <Text style={[styles.profileTabText, profileTab === 'all' && styles.profileTabTextActive]}>
-                All Posts
-              </Text>
-              <View
+                onPress={() => setProfileTab('diary')}
+                onHoverIn={() => setHoveredProfileTab('diary')}
+                onHoverOut={() => setHoveredProfileTab((prev) => (prev === 'diary' ? null : prev))}
+              >
+                <Text style={[styles.profileTabText, profileTab === 'diary' && styles.profileTabTextActive]}>Diary</Text>
+                <View
+                  style={[
+                    styles.profileTabUnderline,
+                    profileTab === 'diary' && styles.profileTabUnderlineActive,
+                  ]}
+                />
+              </Pressable>
+              <Pressable
                 style={[
-                  styles.profileTabUnderline,
-                  profileTab === 'all' && styles.profileTabUnderlineActive,
+                  styles.profileTab,
+                  hoveredProfileTab === 'all' && styles.profileTabHover,
+                  profileTab === 'all' && styles.profileTabActive,
                 ]}
-              />
-            </TouchableOpacity>
+                onPress={() => setProfileTab('all')}
+                onHoverIn={() => setHoveredProfileTab('all')}
+                onHoverOut={() => setHoveredProfileTab((prev) => (prev === 'all' ? null : prev))}
+              >
+                <Text style={[styles.profileTabText, profileTab === 'all' && styles.profileTabTextActive]}>
+                  All Posts
+                </Text>
+                <View
+                  style={[
+                    styles.profileTabUnderline,
+                    profileTab === 'all' && styles.profileTabUnderlineActive,
+                  ]}
+                />
+              </Pressable>
+            </View>
           </View>
         </View>
 
@@ -975,7 +1383,9 @@ export default function HomeScreen() {
                 <TouchableOpacity
                   style={styles.button}
                   onPress={() => {
-                    void handleCreateDiary();
+                    handleCreateDiary().catch((err) => {
+                      setError(err instanceof Error ? err.message : 'Failed to create diary');
+                    });
                   }}
                   disabled={!authState.isLoggedIn || authState.isReadOnly}
                 >
@@ -984,7 +1394,56 @@ export default function HomeScreen() {
               </View>
             )}
 
-            {!!diaryDraft && diaryDraft.entries.length > 0 && (
+            {!!diaryDraft && diaryDraft.entries.length > 0 && !diaryEditMode && (
+              <View style={styles.diaryTilesGrid}>
+                {diaryDraft.entries.map((entry) => {
+                  const note = diaryEvents[entry.id];
+                  const parsedPhaseWeek = parsePhaseWeek(entry.chapter);
+                  const item = diaryItemById.get(entry.id);
+                  const imageUri = item?.image;
+                  const isCoverTile = Boolean(imageUri && selectedDiaryCoverImage && imageUri === selectedDiaryCoverImage);
+
+                  return (
+                    <Pressable
+                      key={entry.id}
+                      style={({ hovered, pressed }) => [
+                        styles.diaryTileCard,
+                        !isMobile && styles.diaryTileCardDesktop,
+                        isMobile && styles.diaryTileCardMobile,
+                        (hovered || pressed) && styles.diaryTileCardHover,
+                      ]}
+                    >
+                      {imageUri ? (
+                        <View style={styles.diaryTileImageWrap}>
+                          <Image source={{ uri: imageUri }} style={styles.diaryTileImage} resizeMode="cover" />
+                          <View pointerEvents="none" style={styles.diaryTileImageShade} />
+                          {isCoverTile && (
+                            <View style={styles.diaryTileCoverBadge}>
+                              <Text style={styles.diaryTileCoverBadgeText}>Cover</Text>
+                            </View>
+                          )}
+                        </View>
+                      ) : (
+                        <View style={styles.diaryTileImageFallback}>
+                          <Text style={styles.diaryTileImageFallbackText}>No image</Text>
+                        </View>
+                      )}
+                      <View style={styles.diaryTileMeta}>
+                        <Text style={styles.diaryTileTitle}>{parsedPhaseWeek.phase || 'General'}</Text>
+                        <Text style={styles.diaryTileSub}>
+                          {parsedPhaseWeek.week ? `Week ${parsedPhaseWeek.week}` : 'Week n/a'}
+                        </Text>
+                        <Text style={styles.diaryTileDate}>
+                          {new Date((note?.created_at || entry.addedAt) * 1000).toLocaleDateString()}
+                        </Text>
+                      </View>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            )}
+
+            {!!diaryDraft && diaryDraft.entries.length > 0 && diaryEditMode && (
               <View>
                 {groupedDiary.map((section) => (
                   <View key={section.chapter} style={styles.chapterSection}>
@@ -996,6 +1455,10 @@ export default function HomeScreen() {
                       const absoluteIndex = diaryDraft
                         ? diaryDraft.entries.findIndex((candidate) => candidate.id === entry.id)
                         : -1;
+                      const parsedPhaseWeek = parsePhaseWeek(entry.chapter);
+                      const item = diaryItemById.get(entry.id);
+                      const imageUri = item?.image;
+                      const isCoverTile = Boolean(imageUri && selectedDiaryCoverImage && imageUri === selectedDiaryCoverImage);
 
                       return (
                         <View key={entry.id} style={styles.diaryCard}>
@@ -1014,54 +1477,116 @@ export default function HomeScreen() {
                             <Text style={styles.diaryCardText}>Post not found on current relays.</Text>
                           )}
 
-                          {diaryEditMode && (
-                            <View style={styles.diaryEditRow}>
-                              <TouchableOpacity
-                                style={styles.iconButton}
-                                onPress={() => {
-                                  if (absoluteIndex >= 0) moveDiaryEntry(absoluteIndex, 'up');
-                                }}
-                              >
-                                <Text style={styles.iconButtonText}>↑</Text>
-                              </TouchableOpacity>
-                              <TouchableOpacity
-                                style={styles.iconButton}
-                                onPress={() => {
-                                  if (absoluteIndex >= 0) moveDiaryEntry(absoluteIndex, 'down');
-                                }}
-                              >
-                                <Text style={styles.iconButtonText}>↓</Text>
-                              </TouchableOpacity>
-                              <TouchableOpacity
-                                style={styles.compactTagButton}
-                                onPress={() =>
-                                  setChapterMenuForEntry((prev) => (prev === entry.id ? null : entry.id))
-                                }
-                              >
-                                <Text style={styles.compactTagButtonText}>{entry.chapter}</Text>
-                              </TouchableOpacity>
-                              <TouchableOpacity style={styles.iconDangerButton} onPress={() => removeDiaryEntry(entry.id)}>
-                                <Text style={styles.iconDangerText}>✕</Text>
-                              </TouchableOpacity>
-                            </View>
-                          )}
-
-                          {diaryEditMode && chapterMenuForEntry === entry.id && (
-                            <View style={styles.chapterMenuWrap}>
-                              {diaryDraft.chapters.map((chapter) => (
-                                <TouchableOpacity
-                                  key={chapter.key}
-                                  style={styles.chapterMenuItem}
-                                  onPress={() => {
-                                    updateEntryChapter(entry.id, chapter.key);
-                                    setChapterMenuForEntry(null);
+                          <View style={styles.diaryEditRow}>
+                            <TouchableOpacity
+                              style={styles.iconButton}
+                              onPress={() => {
+                                if (absoluteIndex >= 0) moveDiaryEntry(absoluteIndex, 'up');
+                              }}
+                            >
+                              <Text style={styles.iconButtonText}>↑</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                              style={styles.iconButton}
+                              onPress={() => {
+                                if (absoluteIndex >= 0) moveDiaryEntry(absoluteIndex, 'down');
+                              }}
+                            >
+                              <Text style={styles.iconButtonText}>↓</Text>
+                            </TouchableOpacity>
+                            <View style={styles.entryPhaseInlineWrap}>
+                              <Text style={styles.entryPhaseInlineLabel}>Phase / Week</Text>
+                              <View style={styles.entryPhaseSplitRow}>
+                                <TextInput
+                                  style={[styles.entryPhaseInlineInput, styles.entryPhaseInlineInputHalf]}
+                                  value={parsedPhaseWeek.phase}
+                                  onChangeText={(value) =>
+                                    updateEntryChapter(entry.id, composePhaseWeek(value, parsedPhaseWeek.week))
+                                  }
+                                  onBlur={() => {
+                                    if (!diaryDraft) return;
+                                    diaryStore
+                                      .setDiaryItemPhaseLabels(diaryDraft.diaryId, { [entry.id]: entry.chapter })
+                                      .catch((err) =>
+                                        setError(err instanceof Error ? err.message : 'Failed to save entry phase')
+                                      );
                                   }}
-                                >
-                                  <Text style={styles.chapterMenuItemText}>{chapter.label}</Text>
-                                </TouchableOpacity>
-                              ))}
+                                  placeholder="Phase"
+                                  placeholderTextColor="#9ca3af"
+                                />
+                                <TextInput
+                                  style={[styles.entryPhaseInlineInput, styles.entryPhaseInlineInputWeek]}
+                                  value={parsedPhaseWeek.week}
+                                  onChangeText={(value) =>
+                                    updateEntryChapter(entry.id, composePhaseWeek(parsedPhaseWeek.phase, value))
+                                  }
+                                  onBlur={() => {
+                                    if (!diaryDraft) return;
+                                    diaryStore
+                                      .setDiaryItemPhaseLabels(diaryDraft.diaryId, { [entry.id]: entry.chapter })
+                                      .catch((err) =>
+                                        setError(err instanceof Error ? err.message : 'Failed to save entry week')
+                                      );
+                                  }}
+                                  placeholder="Week"
+                                  placeholderTextColor="#9ca3af"
+                                />
+                              </View>
+                              <View style={styles.entryPhaseTemplatesRow}>
+                                {PHASE_TEMPLATE_OPTIONS.map((template) => (
+                                  <TouchableOpacity
+                                    key={`${entry.id}-${template}`}
+                                    style={[
+                                      styles.entryPhaseTemplateChip,
+                                      parsedPhaseWeek.phase.toLowerCase().startsWith(template.toLowerCase()) &&
+                                        styles.entryPhaseTemplateChipActive,
+                                    ]}
+                                    onPress={() => {
+                                      updateEntryChapter(entry.id, composePhaseWeek(template, parsedPhaseWeek.week));
+                                      if (!diaryDraft) return;
+                                      diaryStore
+                                        .setDiaryItemPhaseLabels(diaryDraft.diaryId, {
+                                          [entry.id]: composePhaseWeek(template, parsedPhaseWeek.week),
+                                        })
+                                        .catch((err) =>
+                                          setError(err instanceof Error ? err.message : 'Failed to save entry phase')
+                                        );
+                                    }}
+                                  >
+                                    <Text
+                                      style={[
+                                        styles.entryPhaseTemplateChipText,
+                                        parsedPhaseWeek.phase.toLowerCase().startsWith(template.toLowerCase()) &&
+                                          styles.entryPhaseTemplateChipTextActive,
+                                      ]}
+                                    >
+                                      {template}
+                                    </Text>
+                                  </TouchableOpacity>
+                                ))}
+                              </View>
                             </View>
-                          )}
+                            {imageUri && diaryDraft && (
+                              <TouchableOpacity
+                                style={[styles.coverPickButton, isCoverTile && styles.coverPickButtonActive]}
+                                onPress={() => {
+                                  diaryStore
+                                    .setDiaryCoverImage(diaryDraft.diaryId, imageUri)
+                                    .then(() => hydrateDiaryStateFromStore(diaryDraft.diaryId))
+                                    .catch((err) =>
+                                      setError(err instanceof Error ? err.message : 'Failed to set diary cover')
+                                    );
+                                }}
+                              >
+                                <Text style={[styles.coverPickButtonText, isCoverTile && styles.coverPickButtonTextActive]}>
+                                  {isCoverTile ? 'Cover set' : 'Set cover'}
+                                </Text>
+                              </TouchableOpacity>
+                            )}
+                            <TouchableOpacity style={styles.iconDangerButton} onPress={() => removeDiaryEntry(entry.id)}>
+                              <Text style={styles.iconDangerText}>✕</Text>
+                            </TouchableOpacity>
+                          </View>
                         </View>
                       );
                     })}
@@ -1077,11 +1602,54 @@ export default function HomeScreen() {
               <TouchableOpacity
                 style={styles.smallButton}
                 onPress={() => {
-                  void loadAuthorPosts();
+                  loadAuthorPosts().catch((err) => {
+                    setError(err instanceof Error ? err.message : 'Failed to load profile posts');
+                  });
                 }}
               >
                 <Text style={styles.buttonText}>Reload</Text>
               </TouchableOpacity>
+            </View>
+            <View style={styles.feedFilterCard}>
+              <View style={styles.feedFilterHeader}>
+                <Text style={styles.feedFilterTitle}>Profile hashtag filter</Text>
+                <TouchableOpacity
+                  style={[styles.filterToggleBtn, !profileHashtagFilterEnabled && styles.filterToggleBtnMuted]}
+                  onPress={() => setProfileHashtagFilterEnabled((prev) => !prev)}
+                >
+                  <Text style={styles.filterToggleBtnText}>
+                    {profileHashtagFilterEnabled ? 'Filter ON' : 'Filter OFF'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+              {profileHashtagFilterEnabled ? (
+                <>
+                  <View style={styles.hashtagContainer}>
+                    {profileHashtags.map((tag) => (
+                      <View key={tag} style={styles.hashtagBadge}>
+                        <Text style={styles.hashtagText}>#{tag}</Text>
+                        <TouchableOpacity onPress={() => handleRemoveProfileHashtag(tag)}>
+                          <Text style={styles.removeBtn}>✕</Text>
+                        </TouchableOpacity>
+                      </View>
+                    ))}
+                  </View>
+                  <View style={styles.inputGroup}>
+                    <TextInput
+                      style={[styles.input, styles.flexInput]}
+                      placeholder="Filter by hashtag"
+                      placeholderTextColor="#999"
+                      value={newProfileHashtag}
+                      onChangeText={setNewProfileHashtag}
+                    />
+                    <TouchableOpacity style={styles.smallButton} onPress={handleAddProfileHashtag}>
+                      <Text style={styles.buttonText}>Add</Text>
+                    </TouchableOpacity>
+                  </View>
+                </>
+              ) : (
+                <Text style={styles.signerHint}>Show all posts without hashtag filter.</Text>
+              )}
             </View>
             {profileLoading && (
               <View style={styles.centerContent}>
@@ -1089,10 +1657,10 @@ export default function HomeScreen() {
                 <Text style={styles.loadingText}>Loading profile posts...</Text>
               </View>
             )}
-            {!profileLoading && profilePosts.length === 0 && (
+            {!profileLoading && visibleProfilePosts.length === 0 && (
               <Text style={styles.emptyText}>No profile posts found.</Text>
             )}
-            {profilePosts.map((post) => (
+            {visibleProfilePosts.map((post) => (
               <View key={post.id} style={styles.diaryCard}>
                 <Text style={styles.timestamp}>{new Date(post.created_at * 1000).toLocaleString()}</Text>
                 <PostMediaRenderer content={post.content || ''} tags={post.tags} textNumberOfLines={5} />
@@ -1117,11 +1685,16 @@ export default function HomeScreen() {
             <TouchableOpacity
               style={styles.stickyPrimary}
               onPress={handlePublishDiaryChanges}
-              disabled={diaryPublishing}
+              disabled={diaryPublishing || isReadOnlyBlocked}
             >
-              <Text style={styles.buttonText}>{diaryPublishing ? 'Publishing...' : 'Publish changes'}</Text>
+              <Text style={styles.buttonText}>
+                {isReadOnlyBlocked ? 'Publish blocked (read-only)' : diaryPublishing ? 'Publishing...' : 'Publish changes'}
+              </Text>
             </TouchableOpacity>
           </View>
+          {readOnlyBlockHint && (
+            <Text style={styles.readOnlyGuardHint}>{readOnlyBlockHint}</Text>
+          )}
         </View>
       )}
     </View>
@@ -1130,6 +1703,15 @@ export default function HomeScreen() {
   const renderSettingsPage = () => (
     <ScrollView style={styles.pageContainer} showsVerticalScrollIndicator={false}>
       <View style={[styles.pageInner, isMobile && styles.pageInnerMobile]}>
+      <View style={styles.settingsHeaderRow}>
+        <Text style={styles.panelTitle}>Settings</Text>
+        <Text style={styles.statusText}>
+          {settingsSection === 'authentication' && 'Authentication'}
+          {settingsSection === 'relays' && 'Relays'}
+          {settingsSection === 'hashtags' && 'Hashtags'}
+          {settingsSection === 'growmies' && 'Growmies'}
+        </Text>
+      </View>
       {runtimeMode === 'web' && (
         <View style={styles.webModeBanner}>
           <View style={styles.webModeBannerTextWrap}>
@@ -1144,6 +1726,7 @@ export default function HomeScreen() {
         </View>
       )}
 
+      {settingsSection === 'authentication' && (
       <View style={styles.panel}>
         <Text style={styles.panelTitle}>Authentication</Text>
 
@@ -1154,10 +1737,28 @@ export default function HomeScreen() {
             </Text>
             {authState.method === 'signer' && (
               <Text style={styles.signerHint}>
-                Connected via browser signer (NIP-07 / Nostr Connect provider).
+                Connected via signer: {authState.signerKind?.toUpperCase() || 'UNKNOWN'}.
               </Text>
             )}
+            {authState.method === 'signer' && (
+              <Text style={styles.signerHint}>
+                Session status: {authManager.getSignerSessionStatus()}
+              </Text>
+            )}
+            {authState.method === 'signer' && authState.signerKind === 'nip46' && (
+              <View style={styles.nip46StatusRow}>
+                <Text style={styles.signerHint}>NIP-46 pairing: {nip46PhaseLabel}</Text>
+                <TouchableOpacity style={styles.smallButton} onPress={handleRefreshNip46Pairing}>
+                  <Text style={styles.buttonText}>Refresh</Text>
+                </TouchableOpacity>
+              </View>
+            )}
             <Text style={styles.pubkeyText}>{authState.pubkey?.substring(0, 16)}...</Text>
+            {authState.method === 'signer' && authState.signerKind === 'nip46' && (
+              <TouchableOpacity style={styles.buttonSecondary} onPress={handleDisconnectNip46}>
+                <Text style={styles.buttonText}>Disconnect NIP-46</Text>
+              </TouchableOpacity>
+            )}
             <TouchableOpacity style={styles.button} onPress={handleLogout}>
               <Text style={styles.buttonText}>Logout</Text>
             </TouchableOpacity>
@@ -1168,12 +1769,73 @@ export default function HomeScreen() {
               <View>
                 <Text style={styles.statusText}>Web mode prefers browser signer auth.</Text>
                 <TouchableOpacity style={styles.button} onPress={handleConnectSigner}>
-                  <Text style={styles.buttonText}>Connect Alby / NIP-07</Text>
+                  <Text style={styles.buttonText}>Connect Signer (NIP-07/NIP-46)</Text>
                 </TouchableOpacity>
-                {!signerAvailable && (
+                {nip46Available && (
+                  <TouchableOpacity style={styles.buttonSecondary} onPress={handleConnectNip46}>
+                    <Text style={styles.buttonText}>Connect NIP-46 Session</Text>
+                  </TouchableOpacity>
+                )}
+                {!signerAvailable && !nip46Available && (
                   <Text style={styles.signerHint}>
-                    Signer not found. App stays in read-only mode until signer is connected.
+                    No signer found. App stays in read-only mode until NIP-07 or NIP-46 is connected.
                   </Text>
+                )}
+                {(signerAvailable || nip46Available) && (
+                  <Text style={styles.signerHint}>
+                    Signer available: {signerAvailable ? 'NIP-07' : 'NIP-46'}
+                  </Text>
+                )}
+                {nip46BridgePresent && (
+                  <View style={styles.nip46PairingCard}>
+                    <Text style={styles.nip46PairingTitle}>NIP-46 Pairing</Text>
+                    <Text style={styles.signerHint}>Status: {nip46PhaseLabel}</Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Paste bunker:// URI or pairing code (optional)"
+                      placeholderTextColor="#999"
+                      value={nip46PairingInput}
+                      onChangeText={setNip46PairingInput}
+                    />
+                    <View style={styles.nip46PairingActions}>
+                      <TouchableOpacity
+                        style={styles.buttonSecondary}
+                        onPress={handleStartNip46Pairing}
+                        disabled={nip46PairingBusy}
+                      >
+                        <Text style={styles.buttonText}>
+                          {nip46PairingBusy ? 'Pairing...' : 'Start Pairing'}
+                        </Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.smallButton}
+                        onPress={handleRefreshNip46Pairing}
+                        disabled={nip46PairingBusy}
+                      >
+                        <Text style={styles.buttonText}>Refresh</Text>
+                      </TouchableOpacity>
+                    </View>
+                    {nip46PairingState.phase === 'pairing' && (
+                      <TouchableOpacity
+                        style={styles.buttonSecondary}
+                        onPress={handleApproveNip46Pairing}
+                        disabled={nip46PairingBusy}
+                      >
+                        <Text style={styles.buttonText}>
+                          {nip46PairingBusy ? 'Approving...' : 'Approve Pairing'}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+                    {!!nip46PairingState.connectionUri && (
+                      <Text style={styles.nip46PairingMono}>{nip46PairingState.connectionUri}</Text>
+                    )}
+                    {!!nip46PairingState.code && (
+                      <Text style={styles.nip46PairingMono}>Code: {nip46PairingState.code}</Text>
+                    )}
+                    {!!nip46PairingState.message && (
+                      <Text style={styles.signerHint}>{nip46PairingState.message}</Text>
+                    )}
+                  </View>
                 )}
                 <TextInput
                   style={styles.input}
@@ -1188,11 +1850,14 @@ export default function HomeScreen() {
               </View>
             ) : (
               <View>
-                <TouchableOpacity style={styles.buttonSecondary} onPress={handleConnectSigner}>
-                  <Text style={styles.buttonText}>Login with Alby (NIP-07)</Text>
+                <TouchableOpacity style={styles.button} onPress={handleConnectSigner}>
+                  <Text style={styles.buttonText}>Login with Signer (NIP-07/NIP-46)</Text>
                 </TouchableOpacity>
                 <Text style={styles.signerHint}>
-                  Prefer extension signer for safer login. Use nsec only if you trust this device.
+                  Primary path: signer-first auth.
+                </Text>
+                <Text style={styles.signerHint}>
+                  Secondary path: local signer via nsec. Read-only path: npub.
                 </Text>
 
                 <View style={styles.tabContainer}>
@@ -1201,7 +1866,7 @@ export default function HomeScreen() {
                     onPress={() => setActiveAuthTab('nsec')}
                   >
                     <Text style={[styles.tabText, activeAuthTab === 'nsec' && styles.activeTabText]}>
-                      nsec (Full)
+                      Local signer (nsec)
                     </Text>
                   </TouchableOpacity>
                   <TouchableOpacity
@@ -1209,7 +1874,7 @@ export default function HomeScreen() {
                     onPress={() => setActiveAuthTab('npub')}
                   >
                     <Text style={[styles.tabText, activeAuthTab === 'npub' && styles.activeTabText]}>
-                      npub (Read-only)
+                      Read-only (npub)
                     </Text>
                   </TouchableOpacity>
                 </View>
@@ -1233,15 +1898,19 @@ export default function HomeScreen() {
                   />
                 )}
 
-                <TouchableOpacity style={styles.button} onPress={handleLogin}>
-                  <Text style={styles.buttonText}>Login</Text>
+                <TouchableOpacity style={styles.buttonSecondary} onPress={handleLogin}>
+                  <Text style={styles.buttonText}>
+                    {activeAuthTab === 'nsec' ? 'Login with Local Signer' : 'Continue Read-only'}
+                  </Text>
                 </TouchableOpacity>
               </View>
             )}
           </View>
         )}
       </View>
+      )}
 
+      {settingsSection === 'relays' && (
       <View style={styles.panel}>
         <Text style={styles.panelTitle}>Relays</Text>
 
@@ -1272,14 +1941,18 @@ export default function HomeScreen() {
           </TouchableOpacity>
         </View>
       </View>
+      )}
 
+      {settingsSection === 'relays' && (
       <SmartRelayPanel
         allowBackgroundProbe={authState.isLoggedIn}
         onSelectionChanged={() => {
           setRelayUrls(relayManager.getEnabledUrls());
         }}
       />
+      )}
 
+      {settingsSection === 'hashtags' && (
       <View style={styles.panel}>
         <Text style={styles.panelTitle}>Hashtags</Text>
 
@@ -1307,6 +1980,7 @@ export default function HomeScreen() {
           </TouchableOpacity>
         </View>
       </View>
+      )}
 
       {!features.allowFileSystem && (
         <View style={styles.infoBox}>
@@ -1319,6 +1993,67 @@ export default function HomeScreen() {
         <Text style={styles.statusText}>Credits: Wondrej D. Grower & LLM's</Text>
       </View>
 
+      {settingsSection === 'growmies' && (
+      <View style={styles.panel}>
+        <Text style={styles.panelTitle}>🧑‍🌾⚙️ Growmies Settings</Text>
+        <Text style={styles.statusText}>Manage your Growmies list and filtering behavior.</Text>
+        <TouchableOpacity
+          style={styles.buttonSecondary}
+          onPress={() => {
+            growmiesStore
+              .setOnlyGrowmies(!onlyGrowmies)
+              .then(() => {
+                hydrateGrowmiesState();
+              })
+              .catch((err) => setError(err instanceof Error ? err.message : 'Failed to update filter'));
+          }}
+        >
+          <Text style={styles.buttonText}>{onlyGrowmies ? 'Disable Only Growmies' : 'Enable Only Growmies'}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.buttonSecondary}
+          onPress={() => {
+            if (authState.isReadOnly) {
+              setError('Growmies sync requires signer or nsec login.');
+              return;
+            }
+            growmiesStore
+              .sync(authState, relayUrls)
+              .then(() => hydrateGrowmiesState())
+              .catch((err) => setError(err instanceof Error ? err.message : 'Growmies sync failed'));
+          }}
+          disabled={isReadOnlyBlocked}
+        >
+          <Text style={styles.buttonText}>
+            {isReadOnlyBlocked ? 'Sync blocked (read-only)' : 'Sync Growmies to Nostr'}
+          </Text>
+        </TouchableOpacity>
+        {readOnlyBlockHint && <Text style={styles.readOnlyGuardHint}>{readOnlyBlockHint}</Text>}
+      </View>
+      )}
+
+      {settingsSection === 'growmies' && (
+      <View style={styles.panel}>
+        <Text style={styles.panelTitle}>🧑‍🌾 Growmies Members ({growmies.length})</Text>
+        {growmies.length === 0 && <Text style={styles.emptyText}>No Growmies yet. Add from feed cards.</Text>}
+        {growmies.map((pubkey) => (
+          <View key={pubkey} style={styles.relayItem}>
+            <Text style={styles.relayUrl}>{feedAuthorNames[pubkey] || pubkey}</Text>
+            <TouchableOpacity
+              onPress={() => {
+                growmiesStore
+                  .remove(pubkey)
+                  .then(() => hydrateGrowmiesState())
+                  .catch((err) => setError(err instanceof Error ? err.message : 'Failed to remove Growmie'));
+              }}
+            >
+              <Text style={styles.removeBtn}>✕</Text>
+            </TouchableOpacity>
+          </View>
+        ))}
+      </View>
+      )}
+
       <DiagnosticsPanel />
       </View>
     </ScrollView>
@@ -1328,69 +2063,288 @@ export default function HomeScreen() {
     <ScrollView style={styles.pageContainer} showsVerticalScrollIndicator={false}>
       <View style={[styles.pageInner, isMobile && styles.pageInnerMobile]}>
         <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Growmies</Text>
-          <Text style={styles.statusText}>People you follow for feed filtering and quick access.</Text>
-          <TouchableOpacity
-            style={styles.buttonSecondary}
-            onPress={() => {
-              void growmiesStore
-                .setOnlyGrowmies(!onlyGrowmies)
-                .then(() => {
-                  hydrateGrowmiesState();
-                })
-                .catch((err) => setError(err instanceof Error ? err.message : 'Failed to update filter'));
-            }}
-          >
-            <Text style={styles.buttonText}>{onlyGrowmies ? 'Disable Only Growmies' : 'Enable Only Growmies'}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.buttonSecondary}
-            onPress={() => {
-              if (authState.isReadOnly) {
-                setError('Growmies sync requires signer or nsec login.');
-                return;
-              }
-              void growmiesStore
-                .sync(authState, relayUrls)
-                .then(() => hydrateGrowmiesState())
-                .catch((err) => setError(err instanceof Error ? err.message : 'Growmies sync failed'));
-            }}
-          >
-            <Text style={styles.buttonText}>Sync Growmies to Nostr</Text>
-          </TouchableOpacity>
+          <View style={styles.feedHeader}>
+            <Text style={styles.panelTitle}>Growmies Feed</Text>
+            <TouchableOpacity style={styles.smallButton} onPress={handleRefresh}>
+              <Text style={styles.buttonText}>Refresh</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={styles.statusText}>Posts only from authors in your Growmies list.</Text>
+          {growmies.length === 0 && (
+            <Text style={styles.emptyText}>No Growmies added yet. Add people from Feed and they will appear here.</Text>
+          )}
         </View>
 
-        <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Members ({growmies.length})</Text>
-          {growmies.length === 0 && <Text style={styles.emptyText}>No Growmies yet. Add from feed cards.</Text>}
-          {growmies.map((pubkey) => (
-            <View key={pubkey} style={styles.relayItem}>
-              <Text style={styles.relayUrl}>{pubkey}</Text>
-              <TouchableOpacity
-                onPress={() => {
-                  void growmiesStore
-                    .remove(pubkey)
-                    .then(() => hydrateGrowmiesState())
-                    .catch((err) => setError(err instanceof Error ? err.message : 'Failed to remove Growmie'));
-                }}
-              >
-                <Text style={styles.removeBtn}>✕</Text>
-              </TouchableOpacity>
-            </View>
-          ))}
-        </View>
+        {growmiesFeedEvents.map((event) => renderFeedEventCard(event, false))}
+
+        {growmies.length > 0 && !isLoading && growmiesFeedEvents.length === 0 && (
+          <View style={styles.centerContent}>
+            <Text style={styles.emptyText}>No posts from your Growmies yet.</Text>
+          </View>
+        )}
       </View>
     </ScrollView>
   );
 
+  const renderBottomNav = () => (
+    <View style={styles.bottomNavWrap} pointerEvents="box-none">
+      <View style={styles.bottomNav}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Feed"
+          style={({ pressed, hovered }) => [
+            styles.bottomNavItem,
+            activePage === 'feed' && styles.bottomNavItemActive,
+            (pressed || hovered) && styles.bottomNavItemHover,
+          ]}
+          onPress={() => setActivePage('feed')}
+        >
+          <Text style={[styles.bottomNavText, activePage === 'feed' && styles.bottomNavTextActive]}>Feed</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Profile"
+          style={({ pressed, hovered }) => [
+            styles.bottomNavProfileItem,
+            activePage === 'profile' && styles.bottomNavProfileItemActive,
+            (pressed || hovered) && styles.bottomNavProfileItemHover,
+          ]}
+          onPress={() => setActivePage('profile')}
+        >
+          {profileMetadata?.picture ? (
+            <Image
+              source={{ uri: profileMetadata.picture }}
+              style={styles.bottomNavProfileImage}
+              resizeMode="cover"
+            />
+          ) : (
+            <View style={styles.bottomNavProfileFallback}>
+              <Text style={styles.bottomNavProfileText}>{getAvatarLabel(authState, profileMetadata).slice(0, 2)}</Text>
+            </View>
+          )}
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Growmies"
+          style={({ pressed, hovered }) => [
+            styles.bottomNavItem,
+            activePage === 'growmies' && styles.bottomNavItemActive,
+            (pressed || hovered) && styles.bottomNavItemHover,
+          ]}
+          onPress={() => setActivePage('growmies')}
+        >
+          <Text style={[styles.bottomNavText, activePage === 'growmies' && styles.bottomNavTextActive]}>Growmies</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+
+  const openSettingsSection = (section: SettingsSection) => {
+    setSettingsSection(section);
+    setSettingsMenuOpen(false);
+    setActivePage('settings');
+  };
+
+  const isSettingsItemActive = (item: 'profile' | 'diary' | SettingsSection): boolean => {
+    if (item === 'profile') {
+      return activePage === 'profile';
+    }
+    if (item === 'diary') {
+      return activePage === 'profile' && profileTab === 'diary';
+    }
+    return activePage === 'settings' && settingsSection === item;
+  };
+
+  const renderFloatingSettingsMenu = () => (
+    <View style={styles.settingsMenuWrap} pointerEvents="box-none">
+      {settingsMenuOpen && (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Close settings menu"
+          onPress={() => setSettingsMenuOpen(false)}
+          style={styles.settingsMenuBackdrop}
+        />
+      )}
+      <View style={styles.settingsMenuAnchor}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Settings"
+          style={({ pressed, hovered }) => [
+            styles.settingsFloatingButton,
+            (pressed || hovered || settingsMenuOpen) && styles.settingsFloatingButtonActive,
+          ]}
+          onPress={() => setSettingsMenuOpen((prev) => !prev)}
+        >
+          <Text style={styles.settingsFloatingButtonIcon}>⚙</Text>
+        </Pressable>
+        <Animated.View
+          pointerEvents={settingsMenuOpen ? 'auto' : 'none'}
+          style={[
+            styles.settingsMenuDropdown,
+            {
+              opacity: settingsMenuAnim,
+              transform: [
+                {
+                  translateY: settingsMenuAnim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [-8, 0],
+                  }),
+                },
+              ],
+            },
+          ]}
+        >
+          {settingsMenuOpen && (
+            <>
+            <TouchableOpacity
+              style={[
+                styles.settingsMenuItem,
+                isSettingsItemActive('profile') && styles.settingsMenuItemActive,
+              ]}
+              onPress={() => {
+                setSettingsMenuOpen(false);
+                setActivePage('profile');
+              }}
+            >
+              <Text
+                style={[
+                  styles.settingsMenuItemText,
+                  isSettingsItemActive('profile') && styles.settingsMenuItemTextActive,
+                ]}
+              >
+                Profile settings
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.settingsMenuItem,
+                isSettingsItemActive('diary') && styles.settingsMenuItemActive,
+              ]}
+              onPress={() => {
+                setSettingsMenuOpen(false);
+                setActivePage('profile');
+                setProfileTab('diary');
+              }}
+            >
+              <Text
+                style={[
+                  styles.settingsMenuItemText,
+                  isSettingsItemActive('diary') && styles.settingsMenuItemTextActive,
+                ]}
+              >
+                Diaries settings
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.settingsMenuItem,
+                isSettingsItemActive('growmies') && styles.settingsMenuItemActive,
+              ]}
+              onPress={() => openSettingsSection('growmies')}
+            >
+              <Text
+                style={[
+                  styles.settingsMenuItemText,
+                  isSettingsItemActive('growmies') && styles.settingsMenuItemTextActive,
+                ]}
+              >
+                Growmies settings
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.settingsMenuItem,
+                isSettingsItemActive('relays') && styles.settingsMenuItemActive,
+              ]}
+              onPress={() => openSettingsSection('relays')}
+            >
+              <Text
+                style={[
+                  styles.settingsMenuItemText,
+                  isSettingsItemActive('relays') && styles.settingsMenuItemTextActive,
+                ]}
+              >
+                Relay settings
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.settingsMenuItem,
+                styles.settingsMenuItemLast,
+                isSettingsItemActive('hashtags') && styles.settingsMenuItemActive,
+              ]}
+              onPress={() => openSettingsSection('hashtags')}
+            >
+              <Text
+                style={[
+                  styles.settingsMenuItemText,
+                  isSettingsItemActive('hashtags') && styles.settingsMenuItemTextActive,
+                ]}
+              >
+                Hashtag settings
+              </Text>
+            </TouchableOpacity>
+            </>
+          )}
+        </Animated.View>
+      </View>
+    </View>
+  );
+
+  const renderFloatingLoginPrompt = () => {
+    if (!loginPromptLoaded || loginPromptDismissed || authState.isLoggedIn) return null;
+    return (
+      <View style={styles.loginPromptWrap} pointerEvents="box-none">
+        {loginPromptMenuOpen && (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Close login menu"
+            onPress={() => setLoginPromptMenuOpen(false)}
+            style={styles.loginPromptBackdrop}
+          />
+        )}
+        <View style={styles.loginPromptAnchor}>
+          <TouchableOpacity
+            style={styles.loginPromptButton}
+            onPress={() => setLoginPromptMenuOpen((prev) => !prev)}
+            accessibilityRole="button"
+            accessibilityLabel="Login"
+          >
+            <Text style={styles.loginPromptButtonText}>Login</Text>
+          </TouchableOpacity>
+          {loginPromptMenuOpen && (
+            <View style={styles.loginPromptMenu}>
+              <TouchableOpacity
+                style={styles.loginPromptMenuItem}
+                onPress={() => {
+                  setLoginPromptMenuOpen(false);
+                  handleConnectSigner().catch((err) => {
+                    setError(err instanceof Error ? err.message : 'Failed to connect signer');
+                  });
+                }}
+              >
+                <Text style={styles.loginPromptMenuItemText}>Login with Alby</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.loginPromptMenuItem, styles.loginPromptMenuItemLast]}
+                onPress={() => {
+                  setLoginPromptMenuOpen(false);
+                  persistLoginPromptDismissed().catch(() => {
+                    // best-effort persistence only
+                  });
+                }}
+              >
+                <Text style={styles.loginPromptMenuItemText}>Continue as anon</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        </View>
+      </View>
+    );
+  };
+
   return (
     <SafeAreaView style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.title}>Weedoshi Diaries</Text>
-      </View>
-
-      {renderTopNavigation()}
-
       {error && (
         <View style={styles.errorBoxGlobal}>
           <Text style={styles.errorText}>{error}</Text>
@@ -1404,6 +2358,9 @@ export default function HomeScreen() {
       {activePage === 'profile' && renderProfilePage()}
       {activePage === 'growmies' && renderGrowmiesPage()}
       {activePage === 'settings' && renderSettingsPage()}
+      {renderFloatingLoginPrompt()}
+      {renderFloatingSettingsMenu()}
+      {renderBottomNav()}
 
       <Modal visible={addToDiaryModalOpen} transparent animationType="fade" onRequestClose={() => setAddToDiaryModalOpen(false)}>
         <View style={styles.modalOverlay}>
@@ -1443,7 +2400,9 @@ export default function HomeScreen() {
               <TouchableOpacity
                 style={styles.stickyPrimary}
                 onPress={() => {
-                  void handleConfirmAddToDiary();
+                  handleConfirmAddToDiary().catch((err) => {
+                    setError(err instanceof Error ? err.message : 'Failed to add post to diary');
+                  });
                 }}
               >
                 <Text style={styles.buttonText}>Add</Text>
@@ -1461,60 +2420,16 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f9fafb',
   },
-  header: {
-    backgroundColor: '#fff',
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: '#e5e7eb',
-  },
-  title: {
-    fontSize: 22,
-    fontWeight: '700',
-    color: '#059669',
-  },
-  navRow: {
-    flexDirection: 'row',
-    paddingHorizontal: 16,
-    paddingTop: 6,
-    paddingBottom: 0,
-    backgroundColor: '#fff',
-    borderBottomWidth: 1,
-    borderBottomColor: '#e5e7eb',
-  },
-  navLink: {
-    flex: 1,
-    paddingVertical: 10,
-    alignItems: 'center',
-  },
-  navLinkText: {
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#6b7280',
-  },
-  navLinkTextActive: {
-    color: '#065f46',
-    fontWeight: '700',
-  },
-  navLinkUnderline: {
-    marginTop: 7,
-    height: 2,
-    width: 54,
-    borderRadius: 2,
-    backgroundColor: 'transparent',
-  },
-  navLinkUnderlineActive: {
-    backgroundColor: '#059669',
-  },
   pageContainer: {
     flex: 1,
+    paddingBottom: 92,
   },
   pageInner: {
     width: '100%',
     maxWidth: 860,
     alignSelf: 'center',
     paddingHorizontal: 18,
-    paddingTop: 16,
+    paddingTop: 10,
     paddingBottom: 16,
   },
   pageInnerMobile: {
@@ -1543,6 +2458,13 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     color: '#1f2937',
   },
+  settingsHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+    paddingHorizontal: 2,
+  },
   feedHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -1566,8 +2488,8 @@ const styles = StyleSheet.create({
   feedItem: {
     backgroundColor: '#fff',
     borderRadius: 12,
-    padding: 14,
-    marginBottom: 10,
+    padding: 16,
+    marginBottom: 12,
     borderWidth: 1,
     borderColor: '#ecf0ee',
     shadowColor: '#000',
@@ -1576,22 +2498,39 @@ const styles = StyleSheet.create({
     shadowRadius: 3,
     elevation: 1,
   },
-  author: {
+  feedItemHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 8,
+  },
+  feedAuthorAvatar: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#d1fae5',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  feedAuthorAvatarText: {
     fontSize: 12,
+    fontWeight: '700',
+    color: '#065f46',
+  },
+  feedAuthorMeta: {
+    flex: 1,
+    minWidth: 0,
+  },
+  author: {
+    fontSize: 13,
     fontWeight: '600',
-    color: '#059669',
-    fontFamily: 'monospace',
+    color: '#065f46',
+    lineHeight: 16,
   },
   timestamp: {
     fontSize: 11,
     color: '#9ca3af',
-    marginTop: 2,
-  },
-  content: {
-    fontSize: 13,
-    color: '#1f2937',
-    marginTop: 6,
-    lineHeight: 18,
+    marginTop: 3,
   },
   tagsContainer: {
     flexDirection: 'row',
@@ -1601,37 +2540,83 @@ const styles = StyleSheet.create({
   },
   tag: {
     fontSize: 12,
-    color: '#059669',
-    fontWeight: '500',
+    color: '#047857',
+    fontWeight: '600',
+    backgroundColor: '#ecfdf5',
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
   },
   profileHeaderCard: {
     backgroundColor: '#fff',
-    borderRadius: 12,
-    paddingBottom: 14,
+    borderRadius: 14,
+    paddingBottom: 16,
     marginBottom: 12,
+    marginTop: 8,
     borderWidth: 1,
     borderColor: '#e5e7eb',
     overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.05,
+    shadowRadius: 24,
+    elevation: 2,
+  },
+  profileHeaderCardMobile: {
+    marginTop: 6,
+    borderRadius: 12,
+  },
+  profileBannerWrap: {
+    width: '100%',
+    height: 252,
+    overflow: 'hidden',
+    borderTopLeftRadius: 14,
+    borderTopRightRadius: 14,
+  },
+  profileBannerWrapMobile: {
+    height: 196,
   },
   profileBannerImage: {
     width: '100%',
-    height: 132,
+    height: '100%',
     backgroundColor: '#d1d5db',
   },
   profileBannerFallback: {
     width: '100%',
-    height: 110,
+    height: '100%',
     backgroundColor: '#ecfdf5',
     borderBottomWidth: 1,
     borderBottomColor: '#d1fae5',
   },
+  profileBannerOverlayTop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.3)',
+  },
+  profileBannerOverlayBottom: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: '60%',
+    backgroundColor: 'rgba(0,0,0,0.6)',
+  },
+  profileHeaderContent: {
+    marginTop: -38,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+  },
+  profileHeaderContentMobile: {
+    marginTop: -24,
+    paddingHorizontal: 12,
+  },
   profileHeaderRow: {
     flexDirection: 'row',
-    alignItems: 'flex-start',
+    alignItems: 'flex-end',
     gap: 14,
-    marginTop: -28,
     marginBottom: 10,
-    paddingHorizontal: 16,
+  },
+  profileHeaderRowMobile: {
+    gap: 10,
   },
   avatarCircle: {
     width: 88,
@@ -1641,13 +2626,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     overflow: 'hidden',
-    borderWidth: 3,
+    borderWidth: 4,
     borderColor: '#fff',
+    transform: [{ translateY: -35 }],
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 16,
+    elevation: 8,
   },
   avatarCircleMobile: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    transform: [{ translateY: -28 }],
   },
   avatarLabel: {
     fontSize: 24,
@@ -1666,23 +2658,106 @@ const styles = StyleSheet.create({
   },
   profileMeta: {
     flex: 1,
+    paddingTop: 16,
+  },
+  profileNameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
   },
   profileName: {
-    fontSize: 24,
+    fontSize: 25,
     fontWeight: '700',
-    color: '#111827',
+    color: '#111111',
+    flexShrink: 1,
   },
   profilePubkey: {
-    fontSize: 13,
+    fontSize: 12,
     color: '#6b7280',
+    opacity: 0.6,
     marginTop: 4,
     fontFamily: 'monospace',
+    flexShrink: 1,
   },
   profileBio: {
+    fontSize: 15,
+    lineHeight: 24,
+    color: '#444444',
+    marginTop: 16,
+  },
+  profileStatsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 12,
+  },
+  profileStatPill: {
+    borderWidth: 1,
+    borderColor: '#d1fae5',
+    backgroundColor: '#f0fdf4',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    minWidth: 88,
+  },
+  profileStatValue: {
     fontSize: 13,
-    lineHeight: 18,
-    color: '#4b5563',
-    marginTop: 6,
+    fontWeight: '700',
+    color: '#14532d',
+  },
+  profileStatLabel: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: '#166534',
+    marginTop: 2,
+  },
+  diaryCoverHero: {
+    marginHorizontal: 16,
+    marginBottom: 10,
+    borderRadius: 12,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#d1fae5',
+    backgroundColor: '#ecfdf5',
+  },
+  diaryCoverHeroImage: {
+    width: '100%',
+    height: 164,
+    backgroundColor: '#d1d5db',
+  },
+  diaryCoverHeroFallback: {
+    width: '100%',
+    height: 120,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#f3f4f6',
+  },
+  diaryCoverHeroFallbackText: {
+    fontSize: 12,
+    color: '#6b7280',
+    fontWeight: '600',
+  },
+  diaryCoverHeroMeta: {
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  diaryCoverHeroTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#14532d',
+  },
+  diaryCoverHeroSubtitle: {
+    marginTop: 3,
+    fontSize: 12,
+    color: '#166534',
+  },
+  diaryHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 16,
+    marginBottom: 8,
   },
   runSelectorRow: {
     flexDirection: 'row',
@@ -1754,16 +2829,83 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#4b5563',
   },
+  diaryDetailsWrap: {
+    paddingHorizontal: 16,
+    marginBottom: 10,
+  },
+  diaryDetailRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  diaryDetailField: {
+    marginBottom: 8,
+    flex: 1,
+  },
+  diaryDetailFieldHalf: {
+    minWidth: 0,
+  },
+  diaryDetailLabel: {
+    fontSize: 12,
+    color: '#4b5563',
+    fontWeight: '600',
+    marginBottom: 5,
+  },
+  diaryDetailInput: {
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    borderRadius: 8,
+    backgroundColor: '#fff',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 13,
+    color: '#111827',
+  },
+  phaseTemplatesRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 7,
+  },
+  phaseTemplateChip: {
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#bbf7d0',
+    backgroundColor: '#f0fdf4',
+  },
+  phaseTemplateChipActive: {
+    borderColor: '#16a34a',
+    backgroundColor: '#dcfce7',
+  },
+  phaseTemplateChipText: {
+    fontSize: 11,
+    color: '#166534',
+    fontWeight: '600',
+  },
+  phaseTemplateChipTextActive: {
+    color: '#14532d',
+  },
   profileTabs: {
     flexDirection: 'row',
     borderBottomWidth: 1,
     borderBottomColor: '#e5e7eb',
+    marginTop: 10,
     marginBottom: 4,
-    paddingHorizontal: 16,
+    paddingHorizontal: 0,
+    gap: 8,
   },
   profileTab: {
     paddingVertical: 10,
-    marginRight: 20,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    marginRight: 0,
+  },
+  profileTabActive: {
+    backgroundColor: '#ecfdf5',
+  },
+  profileTabHover: {
+    backgroundColor: '#f3f4f6',
   },
   profileTabText: {
     fontSize: 14,
@@ -1772,7 +2914,7 @@ const styles = StyleSheet.create({
   },
   profileTabTextActive: {
     color: '#065f46',
-    fontWeight: '700',
+    fontWeight: '600',
   },
   profileTabUnderline: {
     marginTop: 8,
@@ -1856,20 +2998,98 @@ const styles = StyleSheet.create({
     color: '#1f2937',
     lineHeight: 19,
   },
-  diaryCardImage: {
-    marginTop: 10,
-    width: '100%',
-    maxHeight: 240,
-    height: 180,
-    borderRadius: 8,
-    backgroundColor: '#e5e7eb',
+  diaryTilesGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginBottom: 14,
   },
-  feedImage: {
-    marginTop: 8,
+  diaryTileCard: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 3,
+    elevation: 1,
+  },
+  diaryTileCardDesktop: {
+    width: '31.8%',
+  },
+  diaryTileCardMobile: {
+    width: '48%',
+  },
+  diaryTileCardHover: {
+    borderColor: '#86efac',
+    shadowOpacity: 0.12,
+    shadowRadius: 9,
+    elevation: 3,
+    transform: [{ translateY: -1 }],
+  },
+  diaryTileImageWrap: {
+    position: 'relative',
+  },
+  diaryTileImage: {
     width: '100%',
-    height: 115,
-    borderRadius: 8,
-    backgroundColor: '#e5e7eb',
+    height: 128,
+    backgroundColor: '#d1d5db',
+  },
+  diaryTileImageShade: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 56,
+    backgroundColor: 'rgba(0,0,0,0.24)',
+  },
+  diaryTileCoverBadge: {
+    position: 'absolute',
+    top: 8,
+    left: 8,
+    borderRadius: 999,
+    backgroundColor: 'rgba(5,150,105,0.92)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  diaryTileCoverBadgeText: {
+    fontSize: 10,
+    color: '#ffffff',
+    fontWeight: '700',
+  },
+  diaryTileImageFallback: {
+    width: '100%',
+    height: 128,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#f3f4f6',
+  },
+  diaryTileImageFallbackText: {
+    fontSize: 11,
+    color: '#6b7280',
+    fontWeight: '600',
+  },
+  diaryTileMeta: {
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+  },
+  diaryTileTitle: {
+    fontSize: 13,
+    color: '#111827',
+    fontWeight: '700',
+  },
+  diaryTileSub: {
+    marginTop: 2,
+    fontSize: 11,
+    color: '#047857',
+    fontWeight: '600',
+  },
+  diaryTileDate: {
+    marginTop: 4,
+    fontSize: 10,
+    color: '#6b7280',
   },
   diaryEditRow: {
     flexDirection: 'row',
@@ -1892,18 +3112,62 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '700',
   },
-  compactTagButton: {
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+  entryPhaseInlineWrap: {
+    flex: 1,
+    minWidth: 170,
+  },
+  entryPhaseInlineLabel: {
+    fontSize: 10,
+    color: '#6b7280',
+    marginBottom: 3,
+    fontWeight: '600',
+  },
+  entryPhaseSplitRow: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  entryPhaseInlineInput: {
     borderWidth: 1,
     borderColor: '#d1d5db',
+    borderRadius: 8,
     backgroundColor: '#fff',
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+    fontSize: 12,
+    color: '#111827',
   },
-  compactTagButtonText: {
-    fontSize: 11,
-    color: '#374151',
+  entryPhaseInlineInputHalf: {
+    flex: 1,
+    minWidth: 110,
+  },
+  entryPhaseInlineInputWeek: {
+    width: 86,
+  },
+  entryPhaseTemplatesRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 6,
+  },
+  entryPhaseTemplateChip: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#d1fae5',
+    backgroundColor: '#ecfdf5',
+  },
+  entryPhaseTemplateChipActive: {
+    borderColor: '#059669',
+    backgroundColor: '#d1fae5',
+  },
+  entryPhaseTemplateChipText: {
+    fontSize: 10,
+    color: '#047857',
     fontWeight: '600',
+  },
+  entryPhaseTemplateChipTextActive: {
+    color: '#065f46',
   },
   iconDangerButton: {
     width: 30,
@@ -1920,29 +3184,32 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-  chapterMenuWrap: {
-    marginTop: 8,
+  coverPickButton: {
     borderWidth: 1,
-    borderColor: '#d1d5db',
+    borderColor: '#86efac',
+    backgroundColor: '#f0fdf4',
     borderRadius: 8,
-    backgroundColor: '#fff',
-    overflow: 'hidden',
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    alignSelf: 'flex-start',
   },
-  chapterMenuItem: {
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
+  coverPickButtonActive: {
+    borderColor: '#059669',
+    backgroundColor: '#d1fae5',
   },
-  chapterMenuItemText: {
-    fontSize: 13,
-    color: '#1f2937',
+  coverPickButtonText: {
+    fontSize: 11,
+    color: '#166534',
+    fontWeight: '700',
+  },
+  coverPickButtonTextActive: {
+    color: '#065f46',
   },
   stickyBar: {
     position: 'absolute',
     left: 0,
     right: 0,
-    bottom: 10,
+    bottom: 76,
     alignItems: 'center',
   },
   stickyBarInner: {
@@ -2041,10 +3308,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     alignItems: 'center',
   },
-  tinyLabel: {
-    fontSize: 11,
-    color: '#6b7280',
-  },
   buttonSecondary: {
     backgroundColor: '#059669',
     borderRadius: 6,
@@ -2068,13 +3331,6 @@ const styles = StyleSheet.create({
     color: '#047857',
     fontSize: 12,
     fontWeight: '600',
-  },
-  deleteButton: {
-    backgroundColor: '#dc2626',
-    borderRadius: 6,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    alignItems: 'center',
   },
   buttonText: {
     color: '#fff',
@@ -2184,6 +3440,82 @@ const styles = StyleSheet.create({
     color: '#6b7280',
     marginBottom: 10,
   },
+  feedFilterCard: {
+    borderWidth: 1,
+    borderColor: '#d1fae5',
+    borderRadius: 10,
+    backgroundColor: '#f8fffb',
+    padding: 10,
+    marginBottom: 12,
+  },
+  feedFilterHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+    marginBottom: 8,
+  },
+  feedFilterTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#065f46',
+  },
+  filterToggleBtn: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#34d399',
+    backgroundColor: '#d1fae5',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  filterToggleBtnMuted: {
+    borderColor: '#d1d5db',
+    backgroundColor: '#f3f4f6',
+  },
+  filterToggleBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#065f46',
+  },
+  readOnlyGuardHint: {
+    fontSize: 12,
+    color: '#b45309',
+    marginTop: 8,
+  },
+  nip46StatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+    gap: 8,
+  },
+  nip46PairingCard: {
+    backgroundColor: '#f8fafc',
+    borderWidth: 1,
+    borderColor: '#dbeafe',
+    borderRadius: 8,
+    padding: 10,
+    marginBottom: 12,
+  },
+  nip46PairingTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#1e3a8a',
+    marginBottom: 6,
+  },
+  nip46PairingActions: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center',
+    marginBottom: 8,
+    flexWrap: 'wrap',
+  },
+  nip46PairingMono: {
+    fontSize: 11,
+    color: '#334155',
+    fontFamily: 'monospace',
+    marginBottom: 6,
+  },
   webModeBanner: {
     backgroundColor: '#ecfeff',
     borderRadius: 8,
@@ -2215,6 +3547,224 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 12,
     alignItems: 'center',
+  },
+  bottomNavWrap: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+  },
+  bottomNav: {
+    width: '100%',
+    minHeight: 56,
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 10,
+    backgroundColor: '#ffffff',
+    borderTopWidth: 1,
+    borderTopColor: '#e5e7eb',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 10,
+    elevation: 10,
+  },
+  bottomNavItem: {
+    minHeight: 40,
+    paddingHorizontal: 14,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  bottomNavItemActive: {
+    backgroundColor: '#ecfdf5',
+    borderColor: '#a7f3d0',
+  },
+  bottomNavItemHover: {
+    backgroundColor: '#f3f4f6',
+  },
+  bottomNavText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#6b7280',
+  },
+  bottomNavTextActive: {
+    color: '#065f46',
+  },
+  bottomNavProfileItem: {
+    width: 74,
+    height: 74,
+    borderRadius: 37,
+    marginTop: -30,
+    borderWidth: 2,
+    borderColor: '#ffffff',
+    backgroundColor: '#ffffff',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.18,
+    shadowRadius: 12,
+    elevation: 9,
+  },
+  bottomNavProfileItemActive: {
+    borderColor: '#86efac',
+    backgroundColor: '#ecfdf5',
+  },
+  bottomNavProfileItemHover: {
+    backgroundColor: '#f3f4f6',
+  },
+  bottomNavProfileImage: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+  },
+  bottomNavProfileFallback: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: '#d1fae5',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  bottomNavProfileText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#047857',
+  },
+  settingsMenuWrap: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 40,
+  },
+  settingsMenuBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(17,24,39,0.14)',
+  },
+  settingsMenuAnchor: {
+    position: 'absolute',
+    top: 12,
+    right: 12,
+    alignItems: 'flex-end',
+  },
+  settingsFloatingButton: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    backgroundColor: '#ffffff',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.12,
+    shadowRadius: 10,
+    elevation: 6,
+  },
+  settingsFloatingButtonActive: {
+    backgroundColor: '#f3f4f6',
+  },
+  settingsFloatingButtonIcon: {
+    fontSize: 20,
+    color: '#374151',
+  },
+  settingsMenuDropdown: {
+    marginTop: 8,
+    minWidth: 210,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    backgroundColor: '#ffffff',
+    overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
+    elevation: 10,
+  },
+  settingsMenuItem: {
+    paddingVertical: 11,
+    paddingHorizontal: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f3f4f6',
+  },
+  settingsMenuItemLast: {
+    borderBottomWidth: 0,
+  },
+  settingsMenuItemActive: {
+    backgroundColor: '#ecfdf5',
+  },
+  settingsMenuItemText: {
+    fontSize: 14,
+    color: '#1f2937',
+    fontWeight: '600',
+  },
+  settingsMenuItemTextActive: {
+    color: '#047857',
+  },
+  loginPromptWrap: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 41,
+  },
+  loginPromptBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(17,24,39,0.08)',
+  },
+  loginPromptAnchor: {
+    position: 'absolute',
+    top: 12,
+    left: 12,
+    alignItems: 'flex-start',
+  },
+  loginPromptButton: {
+    borderRadius: 999,
+    backgroundColor: '#16a34a',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.14,
+    shadowRadius: 10,
+    elevation: 6,
+  },
+  loginPromptButtonText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  loginPromptMenu: {
+    marginTop: 8,
+    minWidth: 190,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#dcfce7',
+    backgroundColor: '#ffffff',
+    overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.12,
+    shadowRadius: 16,
+    elevation: 8,
+  },
+  loginPromptMenuItem: {
+    paddingVertical: 11,
+    paddingHorizontal: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0fdf4',
+  },
+  loginPromptMenuItemLast: {
+    borderBottomWidth: 0,
+  },
+  loginPromptMenuItemText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#166534',
   },
   modalOverlay: {
     flex: 1,

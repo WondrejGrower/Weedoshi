@@ -1,6 +1,8 @@
 import type { Event, Filter, UnsignedEvent } from 'nostr-tools';
 import { SimplePool, finalizeEvent } from 'nostr-tools';
 import { diagnostics } from './diagnostics';
+import { assertNoSensitiveMaterial } from './securityBaseline';
+import { requireAtLeastOneSuccess } from './networkResult';
 
 export const DIARY_INDEX_KIND = 30078;
 
@@ -109,6 +111,9 @@ export function parseDiaryIndexEvent(event: Event): DiaryIndex | null {
 
 export function buildDiaryIndexEvent(diaryIndex: DiaryIndex, pubkey: string): UnsignedEvent {
   const title = diaryIndex.title?.trim();
+  if (title) {
+    assertNoSensitiveMaterial(title, 'diary.title');
+  }
   const tags: string[][] = [
     ['d', diaryIndex.diaryId],
     ['t', 'weedoshi'],
@@ -146,12 +151,10 @@ export async function publishDiaryIndexEvent(
     signed = finalizeEvent(event, signer.secretKey as any) as Event;
   }
 
-  const publishPromises = localPool.publish(relays, signed as any);
-  const results = await Promise.allSettled(publishPromises);
-  const hasSuccess = results.some((result) => result.status === 'fulfilled');
-  if (!hasSuccess) {
-    throw new Error('Failed to publish diary index to relays');
-  }
+  await requireAtLeastOneSuccess(
+    localPool.publish(relays, signed as any),
+    'Failed to publish diary index to relays'
+  );
   diagnostics.log(`Published diary index ${event.kind}:${getTagValue(event.tags, 'd') || 'unknown'}`, 'info');
   return signed;
 }

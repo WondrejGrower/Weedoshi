@@ -1,5 +1,6 @@
 import { Component, ErrorInfo, ReactNode } from 'react';
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
+import { logger } from '../lib/logger';
 
 interface Props {
   children: ReactNode;
@@ -22,7 +23,7 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   static getDerivedStateFromError(error: Error): State {
-    console.error('🔴 ErrorBoundary: Caught error in getDerivedStateFromError:', error);
+    logger.error('🔴 ErrorBoundary: Caught error in getDerivedStateFromError:', error);
     return {
       hasError: true,
       error,
@@ -31,9 +32,9 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error('🔴 ErrorBoundary: Component caught error:', error);
-    console.error('🔴 ErrorBoundary: Error info:', errorInfo);
-    console.error('🔴 ErrorBoundary: Component stack:', errorInfo.componentStack);
+    logger.error('🔴 ErrorBoundary: Component caught error:', error);
+    logger.error('🔴 ErrorBoundary: Error info:', errorInfo);
+    logger.error('🔴 ErrorBoundary: Component stack:', errorInfo.componentStack);
     this.setState({
       error,
       errorInfo,
@@ -41,7 +42,7 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   handleReset = () => {
-    console.log('🔄 ErrorBoundary: Resetting error state');
+    logger.info('🔄 ErrorBoundary: Resetting error state');
     this.setState({
       hasError: false,
       error: null,

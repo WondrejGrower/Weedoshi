@@ -28,6 +28,7 @@ export function ReactionBar({
     authState.method === 'signer' &&
     typeof window !== 'undefined' &&
     typeof (window as any).nostr?.signEvent === 'function';
+  const canWriteReaction = authState.isLoggedIn && (!authState.isReadOnly || canUseBrowserSigner);
 
   const handleReact = async (emoji: string) => {
     if (!authState.isLoggedIn) {
@@ -89,7 +90,7 @@ export function ReactionBar({
               userHasReacted(group.emoji) && styles.reactionBadgeActive
             ]}
             onPress={() => handleReact(group.emoji)}
-            disabled={isReacting}
+            disabled={isReacting || !canWriteReaction}
           >
             <Text style={styles.reactionEmoji}>{group.emoji}</Text>
             <Text style={styles.reactionCount}>{group.count}</Text>
@@ -97,7 +98,7 @@ export function ReactionBar({
         ))}
 
         {/* Add reaction button */}
-        {authState.isLoggedIn && (!authState.isReadOnly || canUseBrowserSigner) && (
+        {canWriteReaction && (
           <TouchableOpacity
             style={styles.addButton}
             onPress={() => setShowPicker(!showPicker)}

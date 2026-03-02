@@ -1,5 +1,4 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Platform } from 'react-native';
 
 type JsonValue = unknown;
 
@@ -8,7 +7,7 @@ const STORE_NAME = 'kv';
 const STORAGE_PREFIX = 'weedoshi:';
 
 function isWebRuntime(): boolean {
-  return Platform.OS === 'web';
+  return typeof window !== 'undefined' && typeof document !== 'undefined';
 }
 
 function hasIndexedDb(): boolean {

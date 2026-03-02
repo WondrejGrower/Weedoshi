@@ -161,6 +161,19 @@ async function headContentType(url: string, timeoutMs: number): Promise<string |
   }
 }
 
+function shouldProbeWithHead(url: string): boolean {
+  // On web, probing third-party origins triggers noisy CORS errors in console.
+  if (typeof window !== 'undefined' && typeof window.location !== 'undefined') {
+    try {
+      const parsed = new URL(url);
+      return parsed.origin === window.location.origin;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 export async function enhanceMediaWithHead(
   initial: ExtractedMedia,
   timeoutMs: number = 1500
@@ -175,6 +188,10 @@ export async function enhanceMediaWithHead(
 
   await Promise.all(
     initial.links.map(async (url) => {
+      if (!shouldProbeWithHead(url)) {
+        stillLinks.push(url);
+        return;
+      }
       const type = await headContentType(url, timeoutMs);
       const lowered = (type || '').toLowerCase();
       if (lowered.includes('image/') && nextImages.length < 4) {
