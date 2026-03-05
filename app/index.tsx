@@ -103,6 +103,8 @@ export default function HomeScreen() {
   const [relayUrls, setRelayUrls] = useState<string[]>(relayManager.getEnabledUrls());
   const [hashtags, setHashtags] = useState<string[]>(DEFAULT_HASHTAGS);
   const [feedFilterEnabled, setFeedFilterEnabled] = useState(true);
+  const [feedSearchInput, setFeedSearchInput] = useState('');
+  const [feedSearchQuery, setFeedSearchQuery] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   const [newRelay, setNewRelay] = useState('');
@@ -167,8 +169,16 @@ export default function HomeScreen() {
     relayUrls,
     hashtags,
     filterEnabled: feedFilterEnabled,
+    searchQuery: feedSearchQuery,
     onError: setError,
   });
+
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      setFeedSearchQuery(feedSearchInput.trim());
+    }, 180);
+    return () => clearTimeout(timeout);
+  }, [feedSearchInput]);
 
   useEffect(() => {
     setSignerAvailable(authManager.isBrowserSignerAvailable());
@@ -855,7 +865,7 @@ export default function HomeScreen() {
   useEffect(() => {
     if (relayUrls.length === 0) return;
     refreshFeed();
-  }, [feedFilterEnabled, feedHashtagsKey, refreshFeed, relayUrls.length]);
+  }, [feedFilterEnabled, feedHashtagsKey, feedSearchQuery, refreshFeed, relayUrls.length]);
 
   const profileDiaries = useMemo(
     () =>
@@ -889,11 +899,39 @@ export default function HomeScreen() {
     : null;
 
   const visibleFeedEvents = useMemo(() => {
-    if (!onlyGrowmies) return events;
-    if (growmies.length === 0) return [];
-    const allowed = new Set(growmies);
-    return events.filter((event) => allowed.has(event.author));
-  }, [events, onlyGrowmies, growmies]);
+    let filteredEvents = events;
+    if (onlyGrowmies) {
+      if (growmies.length === 0) {
+        return [];
+      }
+      const allowed = new Set(growmies);
+      filteredEvents = filteredEvents.filter((event) => allowed.has(event.author));
+    }
+
+    const query = feedSearchQuery.trim().toLowerCase();
+    if (!query) {
+      return filteredEvents;
+    }
+
+    const queryTerms = query.split(/\s+/).filter(Boolean);
+    if (queryTerms.length === 0) {
+      return filteredEvents;
+    }
+
+    return filteredEvents.filter((event) => {
+      const authorLabel = feedAuthorNames[event.author] || '';
+      const keywordSpace = [
+        event.content || '',
+        event.author || '',
+        authorLabel,
+        event.hashtags.map((tag) => `#${tag}`).join(' '),
+      ]
+        .join(' ')
+        .toLowerCase();
+
+      return queryTerms.every((term) => keywordSpace.includes(term));
+    });
+  }, [events, onlyGrowmies, growmies, feedSearchQuery, feedAuthorNames]);
 
   const getDiaryTileResizeMode = useCallback((diaryId: string): 'cover' | 'contain' => {
     const aspect = diaryTileAspectById[diaryId];
@@ -1027,6 +1065,18 @@ export default function HomeScreen() {
             </View>
 
             <View style={styles.feedFilterCard}>
+              <View style={styles.feedSearchRow}>
+                <Text style={styles.feedFilterTitle}>Search</Text>
+                <TextInput
+                  style={[styles.input, styles.flexInput]}
+                  placeholder="Search posts, hashtags, author..."
+                  placeholderTextColor="#999"
+                  value={feedSearchInput}
+                  onChangeText={setFeedSearchInput}
+                  autoCorrect={false}
+                  autoCapitalize="none"
+                />
+              </View>
               <View style={styles.feedFilterHeader}>
                 <Text style={styles.feedFilterTitle}>Hashtag filter</Text>
                 <TouchableOpacity
@@ -1085,7 +1135,11 @@ export default function HomeScreen() {
           {!isLoading && visibleFeedEvents.length === 0 && relayUrls.length > 0 && (
             <View style={styles.centerContent}>
               <Text style={styles.emptyText}>
-                {onlyGrowmies ? 'No posts from Growmies yet.' : 'No posts yet.'}
+                {feedSearchQuery
+                  ? 'No matching posts for this search.'
+                  : onlyGrowmies
+                    ? 'No posts from Growmies yet.'
+                    : 'No posts yet.'}
               </Text>
             </View>
           )}
@@ -3235,6 +3289,10 @@ const styles = StyleSheet.create({
     backgroundColor: '#f8f4eb',
     padding: 10,
     marginBottom: 12,
+  },
+  feedSearchRow: {
+    gap: 8,
+    marginBottom: 10,
   },
   feedFilterHeader: {
     flexDirection: 'row',

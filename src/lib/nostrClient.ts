@@ -67,7 +67,8 @@ export class NostrClient {
     hashtags: string[],
     since: number = 0,
     onEvent: (event: NostrEvent) => void,
-    onTimeout?: () => void
+    onTimeout?: () => void,
+    searchQuery?: string
   ): Promise<string> {
     logger.info('🌐 NostrClient: subscribeFeed called');
     logger.info('🌐 NostrClient: Relay URLs:', this.relayUrls);
@@ -94,6 +95,11 @@ export class NostrClient {
       since,
       limit: 100,
     };
+    const normalizedSearchQuery = searchQuery?.trim();
+    if (normalizedSearchQuery) {
+      (filter as any).search = normalizedSearchQuery;
+      diagnostics.log(`Relay-side NIP-50 search enabled: "${normalizedSearchQuery}"`, 'info');
+    }
 
     // Keep relay query broad and apply hashtag filtering client-side.
     // Many events use inline hashtags in content without explicit #t tags.
@@ -110,6 +116,9 @@ export class NostrClient {
 
         // Deliver cached events immediately
         cachedEvents.forEach(event => {
+          if (!eventValidator.validateEvent(event)) {
+            return;
+          }
           const nostrEvent: NostrEvent = { ...event, relayUrl: 'cache' };
           onEvent(nostrEvent);
         });
@@ -278,6 +287,44 @@ export class NostrClient {
     } catch (error) {
       diagnostics.log(
         `Hashtag backfill fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+        'warn'
+      );
+      return [];
+    }
+  }
+
+  async fetchNotesBySearchQuery(
+    query: string,
+    limit: number = 200,
+    maxWaitMs: number = 7000
+  ): Promise<NostrEvent[]> {
+    if (this.relayUrls.length === 0) {
+      return [];
+    }
+
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery) {
+      return [];
+    }
+
+    const filter: Filter = {
+      kinds: [1],
+      limit,
+    };
+    (filter as any).search = normalizedQuery;
+
+    try {
+      const events = await this.pool.querySync(this.relayUrls, filter as any, {
+        maxWait: maxWaitMs,
+        label: 'search-backfill',
+      });
+
+      return events
+        .filter((event) => eventValidator.validateEvent(event))
+        .map((event) => ({ ...event }));
+    } catch (error) {
+      diagnostics.log(
+        `Search backfill failed (relay may not support NIP-50): ${error instanceof Error ? error.message : String(error)}`,
         'warn'
       );
       return [];
