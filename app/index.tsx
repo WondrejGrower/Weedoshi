@@ -3,6 +3,7 @@ import { useRouter, type Href } from 'expo-router';
 import {
   View,
   Text,
+  Alert,
   ScrollView,
   TouchableOpacity,
   Pressable,
@@ -63,6 +64,32 @@ type SettingsSection = 'authentication' | 'relays' | 'hashtags' | 'growmies';
 const LOGIN_PROMPT_DISMISSED_KEY = 'login_prompt_dismissed_v1';
 const ANONYMOUS_BROWSING_ENABLED_KEY = 'anonymous_browsing_enabled_v1';
 const PHASE_TEMPLATE_OPTIONS = ['Seedling', 'Vegetation', 'Flowering', 'Harvest'];
+const FEED_SEARCH_STOPWORDS = new Set([
+  'the',
+  'and',
+  'for',
+  'with',
+  'this',
+  'that',
+  'from',
+  'have',
+  'just',
+  'your',
+  'about',
+  'weed',
+  'plant',
+]);
+
+function tokenizeSearchText(input: string, limit: number = 28): string[] {
+  const normalized = input
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+  const tokens = normalized.match(/[a-z0-9_#]{2,}/g) || [];
+  return tokens
+    .filter((token) => token.length > 2 && !FEED_SEARCH_STOPWORDS.has(token))
+    .slice(0, limit);
+}
 
 function getDiaryCoverForCard(diary: Diary): string | undefined {
   if (diary.coverImage) return diary.coverImage;
@@ -608,6 +635,52 @@ export default function HomeScreen() {
     });
   };
 
+  const handleRenameRun = useCallback(async (run: DiaryRunOption) => {
+    const promptFn = (globalThis as { prompt?: (message?: string, defaultValue?: string) => string | null }).prompt;
+    if (typeof promptFn !== 'function') {
+      setError('Rename prompt is not available on this device.');
+      return;
+    }
+    const nextTitle = promptFn('Rename diary', run.title);
+    if (nextTitle === null) return;
+
+    const normalized = nextTitle.trim();
+    if (!normalized) {
+      setError('Diary name cannot be empty.');
+      return;
+    }
+
+    try {
+      await diaryStore.renameDiary(run.diaryId, normalized);
+      await hydrateDiaryStateFromStore(run.diaryId);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to rename diary');
+    }
+  }, [hydrateDiaryStateFromStore]);
+
+  const handleDeleteRun = useCallback((run: DiaryRunOption) => {
+    Alert.alert(
+      'Delete diary',
+      `Do you really want to delete "${run.title}"? This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            diaryStore
+              .deleteDiary(run.diaryId)
+              .then(() => hydrateDiaryStateFromStore())
+              .catch((err) => {
+                setError(err instanceof Error ? err.message : 'Failed to delete diary');
+              });
+          },
+        },
+      ]
+    );
+  }, [hydrateDiaryStateFromStore]);
+
   const handleLogin = async () => {
     try {
       setError(null);
@@ -933,6 +1006,41 @@ export default function HomeScreen() {
     });
   }, [events, onlyGrowmies, growmies, feedSearchQuery, feedAuthorNames]);
 
+  const feedSearchSuggestions = useMemo(() => {
+    const query = feedSearchInput.trim().toLowerCase();
+    if (!query) return [] as string[];
+
+    const scores = new Map<string, number>();
+    const addScore = (keyword: string, value: number) => {
+      if (!keyword) return;
+      scores.set(keyword, (scores.get(keyword) || 0) + value);
+    };
+
+    for (const event of events.slice(0, 260)) {
+      for (const tag of event.hashtags.slice(0, 8)) {
+        addScore(`#${tag.toLowerCase()}`, 6);
+        addScore(tag.toLowerCase(), 4);
+      }
+      for (const token of tokenizeSearchText(event.content || '', 20)) {
+        addScore(token, 1);
+      }
+      const authorName = feedAuthorNames[event.author] || '';
+      for (const token of tokenizeSearchText(authorName, 8)) {
+        addScore(token, 3);
+      }
+    }
+
+    return Array.from(scores.entries())
+      .map(([keyword, score]) => ({ keyword, score }))
+      .filter((item) => item.keyword.includes(query))
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return a.keyword.localeCompare(b.keyword);
+      })
+      .slice(0, 8)
+      .map((item) => item.keyword);
+  }, [events, feedAuthorNames, feedSearchInput]);
+
   const getDiaryTileResizeMode = useCallback((diaryId: string): 'cover' | 'contain' => {
     const aspect = diaryTileAspectById[diaryId];
     if (!aspect) return 'cover';
@@ -1076,6 +1184,22 @@ export default function HomeScreen() {
                   autoCorrect={false}
                   autoCapitalize="none"
                 />
+                {feedSearchSuggestions.length > 0 && (
+                  <View style={styles.searchSuggestionRow}>
+                    {feedSearchSuggestions.map((keyword) => (
+                      <TouchableOpacity
+                        key={keyword}
+                        style={styles.searchSuggestionChip}
+                        onPress={() => {
+                          setFeedSearchInput(keyword);
+                          setFeedSearchQuery(keyword);
+                        }}
+                      >
+                        <Text style={styles.searchSuggestionText}>{keyword}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                )}
               </View>
               <View style={styles.feedFilterHeader}>
                 <Text style={styles.feedFilterTitle}>Hashtag filter</Text>
@@ -1171,7 +1295,13 @@ export default function HomeScreen() {
           </View>
         )}
 
-        <View style={[styles.profileHeaderCard, isMobile && styles.profileHeaderCardMobile]}>
+        <View
+          style={[
+            styles.profileHeaderCard,
+            isMobile && styles.profileHeaderCardMobile,
+            diaryEditMode && styles.profileHeaderCardEditing,
+          ]}
+        >
           <View style={[styles.profileBannerWrap, isMobile && styles.profileBannerWrapMobile]}>
             {profileMetadata?.banner ? (
               <Image source={{ uri: profileMetadata.banner }} style={styles.profileBannerImage} resizeMode="cover" />
@@ -1290,16 +1420,18 @@ export default function HomeScreen() {
                   <View style={styles.diaryDetailRow}>
                     <View style={[styles.diaryDetailField, styles.diaryDetailFieldHalf]}>
                       <Text style={styles.diaryDetailLabel}>Plant</Text>
-                      <PlantPicker
-                        valueSlug={diaryPlantSlug}
-                        valueName={diaryPlantInput}
-                        onChange={(selection) => {
-                          handlePlantSelection(selection);
-                          persistDiaryDetails().catch(() => {
-                            // error handled in callback
-                          });
-                        }}
-                      />
+                      <View style={styles.plantPickerLayer}>
+                        <PlantPicker
+                          valueSlug={diaryPlantSlug}
+                          valueName={diaryPlantInput}
+                          onChange={(selection) => {
+                            handlePlantSelection(selection);
+                            persistDiaryDetails().catch(() => {
+                              // error handled in callback
+                            });
+                          }}
+                        />
+                      </View>
                       <View style={styles.plantActionsRow}>
                         <TouchableOpacity style={styles.smallButton} onPress={handleOpenPlantDetails}>
                           <Text style={styles.buttonText}>Plant details</Text>
@@ -1409,15 +1541,33 @@ export default function HomeScreen() {
                 {runMenuOpen && runOptions.length > 0 && (
                   <View style={styles.runMenu}>
                     {runOptions.map((run) => (
-                      <TouchableOpacity
-                        key={run.diaryId}
-                        style={styles.runMenuItem}
-                        onPress={() => handleSelectRun(run)}
-                      >
-                        <Text style={styles.runMenuText}>
-                          {run.title} • {run.syncStatus} • {run.itemCount} items
-                        </Text>
-                      </TouchableOpacity>
+                      <View key={run.diaryId} style={styles.runMenuItem}>
+                        <TouchableOpacity style={styles.runMenuSelectBtn} onPress={() => handleSelectRun(run)}>
+                          <Text style={styles.runMenuText}>
+                            {run.title} • {run.syncStatus} • {run.itemCount} items
+                          </Text>
+                        </TouchableOpacity>
+                        <View style={styles.runMenuActions}>
+                          <TouchableOpacity
+                            style={styles.runActionButton}
+                            onPress={() => {
+                              handleRenameRun(run).catch(() => {
+                                // error handled in callback
+                              });
+                            }}
+                          >
+                            <Text style={styles.runActionButtonText}>Rename</Text>
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            style={[styles.runActionButton, styles.runActionButtonDanger]}
+                            onPress={() => handleDeleteRun(run)}
+                          >
+                            <Text style={[styles.runActionButtonText, styles.runActionButtonDangerText]}>
+                              Delete
+                            </Text>
+                          </TouchableOpacity>
+                        </View>
+                      </View>
                     ))}
                   </View>
                 )}
@@ -2541,6 +2691,9 @@ const styles = StyleSheet.create({
     marginTop: 6,
     borderRadius: 12,
   },
+  profileHeaderCardEditing: {
+    overflow: 'visible',
+  },
   profileBannerWrap: {
     width: '100%',
     height: 244,
@@ -2779,6 +2932,35 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     borderBottomWidth: 1,
     borderBottomColor: '#f3f4f6',
+    gap: 8,
+  },
+  runMenuSelectBtn: {
+    width: '100%',
+  },
+  runMenuActions: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center',
+  },
+  runActionButton: {
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    borderRadius: 6,
+    backgroundColor: '#fff',
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+  },
+  runActionButtonDanger: {
+    borderColor: '#fca5a5',
+    backgroundColor: '#fff1f2',
+  },
+  runActionButtonText: {
+    fontSize: 11,
+    color: '#374151',
+    fontWeight: '700',
+  },
+  runActionButtonDangerText: {
+    color: '#b91c1c',
   },
   runMenuText: {
     fontSize: 13,
@@ -2820,6 +3002,10 @@ const styles = StyleSheet.create({
   },
   diaryDetailFieldHalf: {
     minWidth: 0,
+  },
+  plantPickerLayer: {
+    zIndex: 50,
+    elevation: 3,
   },
   diaryDetailLabel: {
     fontSize: 12,
@@ -3293,6 +3479,24 @@ const styles = StyleSheet.create({
   feedSearchRow: {
     gap: 8,
     marginBottom: 10,
+  },
+  searchSuggestionRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  searchSuggestionChip: {
+    borderWidth: 1,
+    borderColor: '#cde1d3',
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    backgroundColor: '#eff8f2',
+  },
+  searchSuggestionText: {
+    fontSize: 11,
+    color: '#1f5d35',
+    fontWeight: '600',
   },
   feedFilterHeader: {
     flexDirection: 'row',
