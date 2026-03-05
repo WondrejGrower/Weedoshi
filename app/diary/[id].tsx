@@ -19,6 +19,7 @@ import { authManager } from '../../src/lib/authManager';
 import { diaryStore, type Diary, type DiaryDetailsInput } from '../../src/lib/diaryStore';
 import { relayManager } from '../../src/lib/relayManager';
 import { diaryManager, fetchEventsByIds } from '../../src/lib/diaryManager';
+import { fetchPublicDiaries } from '../../src/lib/nostrSync';
 import { PostMediaRenderer } from '../../src/components/PostMediaRenderer';
 import { shortPubkey } from '../../src/features/home/profileHelpers';
 import { extractMediaFromContent, parseMediaFromEventTags } from '../../src/lib/mediaExtraction';
@@ -111,9 +112,10 @@ function getAllMediaUrls(entry: DiaryEntryView): string[] {
 
 export default function DiaryDetailPage() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ id?: string | string[]; entryId?: string | string[] }>();
+  const params = useLocalSearchParams<{ id?: string | string[]; entryId?: string | string[]; owner?: string | string[] }>();
   const diaryId = Array.isArray(params.id) ? params.id[0] : params.id;
   const focusEntryId = Array.isArray(params.entryId) ? params.entryId[0] : params.entryId;
+  const ownerPubkeyParam = Array.isArray(params.owner) ? params.owner[0] : params.owner;
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -131,6 +133,7 @@ export default function DiaryDetailPage() {
   const [wikiPointerDraft, setWikiPointerDraft] = useState('');
   const [showMorePlantFields, setShowMorePlantFields] = useState(false);
   const [sortMode, setSortMode] = useState<SortMode>('phase-flow');
+  const [isVisitorDiary, setIsVisitorDiary] = useState(false);
 
   const loadDiary = useCallback(async () => {
     if (!diaryId) {
@@ -143,17 +146,31 @@ export default function DiaryDetailPage() {
     setError(null);
     try {
       const auth = authManager.getState();
-      if (!auth.pubkey) {
-        throw new Error('Login required to open diary detail.');
-      }
-
-      await diaryStore.setUser(auth.pubkey);
       const relayUrls = relayManager.getEnabledUrls();
-      if (relayUrls.length > 0) {
-        await diaryStore.mergePublicDiariesFromRelays(auth.pubkey, relayUrls);
+      const isOwnerView = Boolean(auth.pubkey && (!ownerPubkeyParam || ownerPubkeyParam === auth.pubkey));
+      let selected: Diary | null = null;
+
+      if (isOwnerView) {
+        if (!auth.pubkey) {
+          throw new Error('Login required to open private diary detail.');
+        }
+        setIsVisitorDiary(false);
+        await diaryStore.setUser(auth.pubkey);
+        if (relayUrls.length > 0) {
+          await diaryStore.mergePublicDiariesFromRelays(auth.pubkey, relayUrls);
+        }
+        selected = diaryStore.getDiary(diaryId);
+      } else {
+        const ownerPubkey = ownerPubkeyParam?.trim();
+        if (!ownerPubkey) {
+          throw new Error('Owner pubkey is required for public diary view.');
+        }
+        setIsVisitorDiary(true);
+        const remoteDiaries = await fetchPublicDiaries(ownerPubkey, relayUrls);
+        const remote = remoteDiaries.find((item) => item.id === diaryId) || null;
+        selected = remote ? { ...remote, syncStatus: 'synced' } : null;
       }
 
-      const selected = diaryStore.getDiary(diaryId);
       if (!selected) {
         throw new Error('Diary not found.');
       }
@@ -176,7 +193,7 @@ export default function DiaryDetailPage() {
     } finally {
       setLoading(false);
     }
-  }, [diaryId]);
+  }, [diaryId, ownerPubkeyParam]);
 
   useEffect(() => {
     loadDiary().catch(() => {
@@ -340,9 +357,16 @@ export default function DiaryDetailPage() {
           <Pressable style={styles.backButton} onPress={() => router.back()}>
             <Text style={styles.backButtonText}>← Back</Text>
           </Pressable>
-          {!editMode ? (
-            <TouchableOpacity style={styles.editButton} onPress={() => setEditMode(true)}>
-              <Text style={styles.editButtonText}>Edit</Text>
+          {!editMode || isVisitorDiary ? (
+            <TouchableOpacity
+              style={[styles.editButton, isVisitorDiary && styles.editButtonDisabled]}
+              onPress={() => {
+                if (isVisitorDiary) return;
+                setEditMode(true);
+              }}
+              disabled={isVisitorDiary}
+            >
+              <Text style={styles.editButtonText}>{isVisitorDiary ? 'Read only' : 'Edit'}</Text>
             </TouchableOpacity>
           ) : (
             <View style={styles.editActions}>
@@ -388,6 +412,11 @@ export default function DiaryDetailPage() {
 
         {!loading && diary && (
           <View style={styles.content}>
+            {isVisitorDiary && (
+              <View style={styles.infoBox}>
+                <Text style={styles.infoText}>Viewing public diary as visitor.</Text>
+              </View>
+            )}
             <View style={styles.metaCard}>
               {!editMode ? (
                 <Text style={styles.metaTitle}>{diary.title}</Text>
@@ -424,7 +453,7 @@ export default function DiaryDetailPage() {
               ) : null}
               <Text style={styles.metaText}>Entries: {diary.items.length}</Text>
               {diary.coverImage ? <Text style={styles.metaText}>Cover: custom image selected</Text> : null}
-              {editMode && (
+              {editMode && !isVisitorDiary && (
                 <View style={styles.metaEditSection}>
                   <Text style={styles.metaLabel}>Plant</Text>
                   <PlantPicker
@@ -480,12 +509,12 @@ export default function DiaryDetailPage() {
                   )}
                 </View>
               )}
-              {editMode && (
+              {editMode && !isVisitorDiary && (
                 <TouchableOpacity style={styles.deleteDiaryButton} onPress={handleDeleteDiary}>
                   <Text style={styles.deleteDiaryButtonText}>Delete diary</Text>
                 </TouchableOpacity>
               )}
-              {editMode && (
+              {editMode && !isVisitorDiary && (
                 <View style={styles.coverEditorCard}>
                   <Text style={styles.coverEditorTitle}>Cover image</Text>
                   {coverImageDraft ? (
@@ -561,7 +590,7 @@ export default function DiaryDetailPage() {
               const eventStorage = entry.content ? 'Relay event' : 'Local diary cache';
               return (
                 <View key={entry.eventId} style={styles.entryCard}>
-                  {!editMode ? (
+                  {!editMode || isVisitorDiary ? (
                     <Text style={styles.entryTitle}>
                       {parsed.phase}
                       {parsed.week ? ` • Week ${parsed.week}` : ''}
@@ -639,7 +668,7 @@ export default function DiaryDetailPage() {
                       </TouchableOpacity>
                     ) : null}
                   </View>
-                  {editMode && (
+                  {editMode && !isVisitorDiary && (
                     <View style={styles.entryActionRow}>
                       {mediaUrl ? (
                         <TouchableOpacity
@@ -736,6 +765,9 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     backgroundColor: '#f8f4ea',
   },
+  editButtonDisabled: {
+    opacity: 0.7,
+  },
   editButtonText: {
     color: '#2f6b3f',
     fontWeight: '700',
@@ -799,6 +831,17 @@ const styles = StyleSheet.create({
   errorText: {
     color: '#991b1b',
     fontSize: 13,
+  },
+  infoBox: {
+    backgroundColor: '#eff6ff',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 10,
+  },
+  infoText: {
+    color: '#1e3a8a',
+    fontSize: 12,
+    fontWeight: '600',
   },
   content: {
     paddingHorizontal: 14,

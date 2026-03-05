@@ -21,10 +21,8 @@ import type { Event as NostrRawEvent } from 'nostr-tools';
 import { nostrClient } from '../src/lib/nostrClient';
 import { authManager } from '../src/lib/authManager';
 import { relayManager } from '../src/lib/relayManager';
-import { DiagnosticsPanel } from '../src/components/DiagnosticsPanel';
 import { ReactionBar } from '../src/components/ReactionBar';
 import { ThreadIndicator } from '../src/components/ThreadIndicator';
-import { SmartRelayPanel } from '../src/components/SmartRelayPanel';
 import { PostMediaRenderer } from '../src/components/PostMediaRenderer';
 import { PlantPicker } from '../src/components/PlantPicker';
 import { reactionManager } from '../src/lib/reactionManager';
@@ -56,6 +54,8 @@ import { normalizePlantDTagSlug } from '../src/lib/plants/catalog';
 import type { PlantSelection } from '../src/lib/plants/types';
 import { FeedPage } from '../src/features/home/components/FeedPage';
 import { RunMenu } from '../src/features/home/components/RunMenu';
+import { GrowmiesPage } from '../src/features/home/components/GrowmiesPage';
+import { SettingsPage } from '../src/features/home/components/SettingsPage';
 import {
   buildFeedSearchSuggestions,
   eventMatchesFeedQuery,
@@ -1003,17 +1003,23 @@ export default function HomeScreen() {
   const renderFeedEventCard = (event: typeof events[number], allowAddToGrowmies: boolean) => (
     <View key={event.id} style={styles.feedItem}>
       <View style={styles.feedItemHeader}>
-        <View style={styles.feedAuthorAvatar}>
+        <TouchableOpacity
+          style={styles.feedAuthorAvatar}
+          onPress={() => router.push(`/profile/${encodeURIComponent(event.author)}` as Href)}
+        >
           <Text style={styles.feedAuthorAvatarText}>
             {(feedAuthorNames[event.author] || shortPubkey(event.author)).slice(0, 1).toUpperCase()}
           </Text>
-        </View>
-        <View style={styles.feedAuthorMeta}>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.feedAuthorMeta}
+          onPress={() => router.push(`/profile/${encodeURIComponent(event.author)}` as Href)}
+        >
           <Text style={styles.author}>
             {feedAuthorNames[event.author] || shortPubkey(event.author)}
           </Text>
           <Text style={styles.timestamp}>{event.timestamp}</Text>
-        </View>
+        </TouchableOpacity>
       </View>
       <PostMediaRenderer content={event.content} tags={event.tags} textNumberOfLines={5} />
       <View style={styles.tagsContainer}>
@@ -1643,400 +1649,73 @@ export default function HomeScreen() {
   );
 
   const renderSettingsPage = () => (
-    <ScrollView style={styles.pageContainer} showsVerticalScrollIndicator={false}>
-      <View style={[styles.pageInner, isMobile && styles.pageInnerMobile]}>
-      <View style={styles.settingsHeaderRow}>
-        <Text style={styles.panelTitle}>Settings</Text>
-        <Text style={styles.statusText}>
-          {settingsSection === 'authentication' && 'Authentication'}
-          {settingsSection === 'relays' && 'Relays'}
-          {settingsSection === 'hashtags' && 'Hashtags'}
-          {settingsSection === 'growmies' && 'Growmies'}
-        </Text>
-      </View>
-      {runtimeMode === 'web' && (
-        <View style={styles.webModeBanner}>
-          <View style={styles.webModeBannerTextWrap}>
-            <Text style={styles.webModeBannerTitle}>Web mode</Text>
-            <Text style={styles.webModeBannerSubtitle}>
-              Browser-safe mode: signer-based auth and restricted native features.
-            </Text>
-          </View>
-          <TouchableOpacity style={styles.webModeOpenAppButton} onPress={handleOpenApp}>
-            <Text style={styles.buttonText}>Open App</Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      {settingsSection === 'authentication' && (
-      <View style={styles.panel}>
-        <Text style={styles.panelTitle}>Authentication</Text>
-
-        {authState.isLoggedIn ? (
-          <View>
-            <Text style={styles.statusText}>
-              Logged in as {authState.isReadOnly ? '(read-only)' : '(full access)'}
-            </Text>
-            {authState.method === 'signer' && (
-              <Text style={styles.signerHint}>
-                Connected via signer: {authState.signerKind?.toUpperCase() || 'UNKNOWN'}.
-              </Text>
-            )}
-            {authState.method === 'signer' && (
-              <Text style={styles.signerHint}>
-                Session status: {authManager.getSignerSessionStatus()}
-              </Text>
-            )}
-            {authState.method === 'signer' && authState.signerKind === 'nip46' && (
-              <View style={styles.nip46StatusRow}>
-                <Text style={styles.signerHint}>NIP-46 pairing: {nip46PhaseLabel}</Text>
-                <TouchableOpacity style={styles.smallButton} onPress={handleRefreshNip46Pairing}>
-                  <Text style={styles.buttonText}>Refresh</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-            <Text style={styles.pubkeyText}>{authState.pubkey?.substring(0, 16)}...</Text>
-            {authState.method === 'signer' && authState.signerKind === 'nip46' && (
-              <TouchableOpacity style={styles.buttonSecondary} onPress={handleDisconnectNip46}>
-                <Text style={styles.buttonText}>Disconnect NIP-46</Text>
-              </TouchableOpacity>
-            )}
-            <TouchableOpacity style={styles.button} onPress={handleLogout}>
-              <Text style={styles.buttonText}>Logout & Browse Anonymous</Text>
-            </TouchableOpacity>
-          </View>
-        ) : (
-          <View>
-            {anonymousBrowsingEnabled && (
-              <Text style={styles.signerHint}>
-                Anonymous mode active: feed browsing is enabled without login.
-              </Text>
-            )}
-            {runtimeMode === 'web' ? (
-              <View>
-                <Text style={styles.statusText}>Web mode prefers browser signer auth.</Text>
-                <TouchableOpacity style={styles.button} onPress={handleConnectSigner}>
-                  <Text style={styles.buttonText}>Connect Signer (NIP-07/NIP-46)</Text>
-                </TouchableOpacity>
-                {nip46Available && (
-                  <TouchableOpacity style={styles.buttonSecondary} onPress={handleConnectNip46}>
-                    <Text style={styles.buttonText}>Connect NIP-46 Session</Text>
-                  </TouchableOpacity>
-                )}
-                {!signerAvailable && !nip46Available && (
-                  <Text style={styles.signerHint}>
-                    No signer found. App stays in read-only mode until NIP-07 or NIP-46 is connected.
-                  </Text>
-                )}
-                {(signerAvailable || nip46Available) && (
-                  <Text style={styles.signerHint}>
-                    Signer available: {signerAvailable ? 'NIP-07' : 'NIP-46'}
-                  </Text>
-                )}
-                {nip46BridgePresent && (
-                  <View style={styles.nip46PairingCard}>
-                    <Text style={styles.nip46PairingTitle}>NIP-46 Pairing</Text>
-                    <Text style={styles.signerHint}>Status: {nip46PhaseLabel}</Text>
-                    <TextInput
-                      style={styles.input}
-                      placeholder="Paste bunker:// URI or pairing code (optional)"
-                      placeholderTextColor="#999"
-                      value={nip46PairingInput}
-                      onChangeText={setNip46PairingInput}
-                    />
-                    <View style={styles.nip46PairingActions}>
-                      <TouchableOpacity
-                        style={styles.buttonSecondary}
-                        onPress={handleStartNip46Pairing}
-                        disabled={nip46PairingBusy}
-                      >
-                        <Text style={styles.buttonText}>
-                          {nip46PairingBusy ? 'Pairing...' : 'Start Pairing'}
-                        </Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity
-                        style={styles.smallButton}
-                        onPress={handleRefreshNip46Pairing}
-                        disabled={nip46PairingBusy}
-                      >
-                        <Text style={styles.buttonText}>Refresh</Text>
-                      </TouchableOpacity>
-                    </View>
-                    {nip46PairingState.phase === 'pairing' && (
-                      <TouchableOpacity
-                        style={styles.buttonSecondary}
-                        onPress={handleApproveNip46Pairing}
-                        disabled={nip46PairingBusy}
-                      >
-                        <Text style={styles.buttonText}>
-                          {nip46PairingBusy ? 'Approving...' : 'Approve Pairing'}
-                        </Text>
-                      </TouchableOpacity>
-                    )}
-                    {!!nip46PairingState.connectionUri && (
-                      <Text style={styles.nip46PairingMono}>{nip46PairingState.connectionUri}</Text>
-                    )}
-                    {!!nip46PairingState.code && (
-                      <Text style={styles.nip46PairingMono}>Code: {nip46PairingState.code}</Text>
-                    )}
-                    {!!nip46PairingState.message && (
-                      <Text style={styles.signerHint}>{nip46PairingState.message}</Text>
-                    )}
-                  </View>
-                )}
-                <TextInput
-                  style={styles.input}
-                  placeholder="Enter npub (read-only)"
-                  placeholderTextColor="#999"
-                  value={npubInput}
-                  onChangeText={setNpubInput}
-                />
-                <TouchableOpacity style={styles.buttonSecondary} onPress={handleLogin}>
-                  <Text style={styles.buttonText}>Continue Read-only</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.buttonSecondary} onPress={enableAnonymousBrowsing}>
-                  <Text style={styles.buttonText}>Browse as Anonymous</Text>
-                </TouchableOpacity>
-              </View>
-            ) : (
-              <View>
-                <TouchableOpacity style={styles.button} onPress={handleConnectSigner}>
-                  <Text style={styles.buttonText}>Login with Signer (NIP-07/NIP-46)</Text>
-                </TouchableOpacity>
-                <Text style={styles.signerHint}>
-                  Primary path: signer-first auth.
-                </Text>
-                <Text style={styles.signerHint}>
-                  Secondary path: local signer via nsec. Read-only path: npub.
-                </Text>
-
-                <View style={styles.tabContainer}>
-                  <TouchableOpacity
-                    style={[styles.tab, activeAuthTab === 'nsec' && styles.activeTab]}
-                    onPress={() => setActiveAuthTab('nsec')}
-                  >
-                    <Text style={[styles.tabText, activeAuthTab === 'nsec' && styles.activeTabText]}>
-                      Local signer (nsec)
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.tab, activeAuthTab === 'npub' && styles.activeTab]}
-                    onPress={() => setActiveAuthTab('npub')}
-                  >
-                    <Text style={[styles.tabText, activeAuthTab === 'npub' && styles.activeTabText]}>
-                      Read-only (npub)
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-
-                {activeAuthTab === 'nsec' ? (
-                  <TextInput
-                    style={styles.input}
-                    placeholder="Enter nsec (private key)"
-                    placeholderTextColor="#999"
-                    value={nsecInput}
-                    onChangeText={setNsecInput}
-                    secureTextEntry
-                  />
-                ) : (
-                  <TextInput
-                    style={styles.input}
-                    placeholder="Enter npub (public key)"
-                    placeholderTextColor="#999"
-                    value={npubInput}
-                    onChangeText={setNpubInput}
-                  />
-                )}
-
-                <TouchableOpacity style={styles.buttonSecondary} onPress={handleLogin}>
-                  <Text style={styles.buttonText}>
-                    {activeAuthTab === 'nsec' ? 'Login with Local Signer' : 'Continue Read-only'}
-                  </Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.buttonSecondary} onPress={enableAnonymousBrowsing}>
-                  <Text style={styles.buttonText}>Browse as Anonymous</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-          </View>
-        )}
-      </View>
-      )}
-
-      {settingsSection === 'relays' && (
-      <View style={styles.panel}>
-        <Text style={styles.panelTitle}>Relays</Text>
-
-        {relayManager.getAllRelays().map((relay) => (
-          <View key={relay.url} style={styles.relayItem}>
-            <TouchableOpacity style={styles.checkbox} onPress={() => handleToggleRelay(relay.url)}>
-              {relay.enabled && <Text style={styles.checkmark}>✓</Text>}
-            </TouchableOpacity>
-            <Text style={styles.relayUrl}>{relay.url}</Text>
-            {relay.custom && (
-              <TouchableOpacity onPress={() => handleRemoveRelay(relay.url)}>
-                <Text style={styles.removeBtn}>✕</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-        ))}
-
-        <View style={styles.inputGroup}>
-          <TextInput
-            style={[styles.input, styles.flexInput]}
-            placeholder="Add custom relay (wss://...)"
-            placeholderTextColor="#999"
-            value={newRelay}
-            onChangeText={setNewRelay}
-          />
-          <TouchableOpacity style={styles.smallButton} onPress={handleAddRelay}>
-            <Text style={styles.buttonText}>Add</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-      )}
-
-      {settingsSection === 'relays' && (
-      <SmartRelayPanel
-        allowBackgroundProbe={authState.isLoggedIn}
-        onSelectionChanged={() => {
-          setRelayUrls(relayManager.getEnabledUrls());
-        }}
-      />
-      )}
-
-      {settingsSection === 'hashtags' && (
-      <View style={styles.panel}>
-        <Text style={styles.panelTitle}>Hashtags</Text>
-
-        <View style={styles.hashtagContainer}>
-          {hashtags.map((tag) => (
-            <View key={tag} style={styles.hashtagBadge}>
-              <Text style={styles.hashtagText}>{tag}</Text>
-              <TouchableOpacity onPress={() => handleRemoveHashtag(tag)}>
-                <Text style={styles.removeBtn}>✕</Text>
-              </TouchableOpacity>
-            </View>
-          ))}
-        </View>
-
-        <View style={styles.inputGroup}>
-          <TextInput
-            style={[styles.input, styles.flexInput]}
-            placeholder="Add hashtag (#...)"
-            placeholderTextColor="#999"
-            value={newHashtag}
-            onChangeText={setNewHashtag}
-          />
-          <TouchableOpacity style={styles.smallButton} onPress={handleAddHashtag}>
-            <Text style={styles.buttonText}>Add</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-      )}
-
-      {!features.allowFileSystem && (
-        <View style={styles.infoBox}>
-          <Text style={styles.infoText}>Native-only features are hidden in web mode.</Text>
-        </View>
-      )}
-
-      <View style={styles.panel}>
-        <Text style={styles.panelTitle}>Credits</Text>
-        <Text style={styles.statusText}>Credits: Wondrej D. Grower & LLM's</Text>
-      </View>
-
-      {settingsSection === 'growmies' && (
-      <View style={styles.panel}>
-        <Text style={styles.panelTitle}>🧑‍🌾⚙️ Growmies Settings</Text>
-        <Text style={styles.statusText}>Manage your Growmies list and filtering behavior.</Text>
-        <TouchableOpacity
-          style={styles.buttonSecondary}
-          onPress={() => {
-            growmiesStore
-              .setOnlyGrowmies(!onlyGrowmies)
-              .then(() => {
-                hydrateGrowmiesState();
-              })
-              .catch((err) => setError(err instanceof Error ? err.message : 'Failed to update filter'));
-          }}
-        >
-          <Text style={styles.buttonText}>{onlyGrowmies ? 'Disable Only Growmies' : 'Enable Only Growmies'}</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={styles.buttonSecondary}
-          onPress={() => {
-            if (authState.isReadOnly) {
-              setError('Growmies sync requires signer or nsec login.');
-              return;
-            }
-            growmiesStore
-              .sync(authState, relayUrls)
-              .then(() => hydrateGrowmiesState())
-              .catch((err) => setError(err instanceof Error ? err.message : 'Growmies sync failed'));
-          }}
-          disabled={isReadOnlyBlocked}
-        >
-          <Text style={styles.buttonText}>
-            {isReadOnlyBlocked ? 'Sync blocked (read-only)' : 'Sync Growmies to Nostr'}
-          </Text>
-        </TouchableOpacity>
-        {readOnlyBlockHint && <Text style={styles.readOnlyGuardHint}>{readOnlyBlockHint}</Text>}
-      </View>
-      )}
-
-      {settingsSection === 'growmies' && (
-      <View style={styles.panel}>
-        <Text style={styles.panelTitle}>🧑‍🌾 Growmies Members ({growmies.length})</Text>
-        {growmies.length === 0 && <Text style={styles.emptyText}>No Growmies yet. Add from feed cards.</Text>}
-        {growmies.map((pubkey) => (
-          <View key={pubkey} style={styles.relayItem}>
-            <Text style={styles.relayUrl}>{feedAuthorNames[pubkey] || pubkey}</Text>
-            <TouchableOpacity
-              onPress={() => {
-                growmiesStore
-                  .remove(pubkey)
-                  .then(() => hydrateGrowmiesState())
-                  .catch((err) => setError(err instanceof Error ? err.message : 'Failed to remove Growmie'));
-              }}
-            >
-              <Text style={styles.removeBtn}>✕</Text>
-            </TouchableOpacity>
-          </View>
-        ))}
-      </View>
-      )}
-
-      <DiagnosticsPanel />
-      </View>
-    </ScrollView>
+    <SettingsPage
+      styles={styles}
+      isMobile={isMobile}
+      settingsSection={settingsSection}
+      authState={authState}
+      anonymousBrowsingEnabled={anonymousBrowsingEnabled}
+      signerAvailable={signerAvailable}
+      nip46Available={nip46Available}
+      nip46BridgePresent={nip46BridgePresent}
+      nip46PairingState={nip46PairingState}
+      nip46PairingInput={nip46PairingInput}
+      nip46PairingBusy={nip46PairingBusy}
+      setNip46PairingInput={setNip46PairingInput}
+      handleStartNip46Pairing={handleStartNip46Pairing}
+      handleRefreshNip46Pairing={handleRefreshNip46Pairing}
+      handleApproveNip46Pairing={handleApproveNip46Pairing}
+      handleDisconnectNip46={handleDisconnectNip46}
+      nsecInput={nsecInput}
+      npubInput={npubInput}
+      activeAuthTab={activeAuthTab}
+      setActiveAuthTab={setActiveAuthTab}
+      setNsecInput={setNsecInput}
+      setNpubInput={setNpubInput}
+      handleLogin={handleLogin}
+      handleConnectSigner={handleConnectSigner}
+      handleConnectNip46={handleConnectNip46}
+      enableAnonymousBrowsing={enableAnonymousBrowsing}
+      relayManager={relayManager}
+      handleToggleRelay={handleToggleRelay}
+      handleRemoveRelay={handleRemoveRelay}
+      newRelay={newRelay}
+      setNewRelay={setNewRelay}
+      handleAddRelay={handleAddRelay}
+      hashtags={hashtags}
+      handleRemoveHashtag={handleRemoveHashtag}
+      newHashtag={newHashtag}
+      setNewHashtag={setNewHashtag}
+      handleAddHashtag={handleAddHashtag}
+      features={features}
+      onlyGrowmies={onlyGrowmies}
+      growmiesStore={growmiesStore}
+      hydrateGrowmiesState={hydrateGrowmiesState}
+      setError={setError}
+      isReadOnlyBlocked={isReadOnlyBlocked}
+      readOnlyBlockHint={readOnlyBlockHint}
+      relayUrls={relayUrls}
+      growmies={growmies}
+      feedAuthorNames={feedAuthorNames}
+      setRelayUrls={setRelayUrls}
+      handleLogout={handleLogout}
+      runtimeMode={runtimeMode}
+      handleOpenApp={handleOpenApp}
+      authManager={authManager}
+      nip46PhaseLabel={nip46PhaseLabel}
+    />
   );
 
   const renderGrowmiesPage = () => (
-    <ScrollView style={styles.pageContainer} showsVerticalScrollIndicator={false}>
-      <View style={[styles.pageInner, isMobile && styles.pageInnerMobile]}>
-        <View style={styles.panel}>
-          <View style={styles.feedHeader}>
-            <Text style={styles.panelTitle}>Growmies Feed</Text>
-            <TouchableOpacity style={styles.smallButton} onPress={handleRefresh}>
-              <Text style={styles.buttonText}>Refresh</Text>
-            </TouchableOpacity>
-          </View>
-          <Text style={styles.statusText}>Posts only from authors in your Growmies list.</Text>
-          {growmies.length === 0 && (
-            <Text style={styles.emptyText}>No Growmies added yet. Add people from Feed and they will appear here.</Text>
-          )}
-        </View>
-
-        {growmiesFeedEvents.map((event) => renderFeedEventCard(event, false))}
-
-        {growmies.length > 0 && !isLoading && growmiesFeedEvents.length === 0 && (
-          <View style={styles.centerContent}>
-            <Text style={styles.emptyText}>No posts from your Growmies yet.</Text>
-          </View>
-        )}
-      </View>
-    </ScrollView>
+    <GrowmiesPage
+      styles={styles}
+      isMobile={isMobile}
+      onRefresh={handleRefresh}
+      growmiesCount={growmies.length}
+      growmiesFeedEvents={growmiesFeedEvents}
+      isLoading={isLoading}
+      renderFeedEventCard={renderFeedEventCard}
+    />
   );
 
   const renderBottomNav = () => (
