@@ -11,6 +11,10 @@ Decentralized Nostr client focused on the cannabis community, built with Expo + 
 - Thread parsing (NIP-10)
 - Relay health diagnostics and smart relay selection
 - Local event cache for faster startup
+- Plant Encyclopedia flow:
+  - offline plant catalog (latin/common/synonyms)
+  - Plant picker with recents/favorites/custom
+  - lazy NIP-54 wiki fetch (kind 30818) on plant details screen
 
 ## Tech Stack
 
@@ -110,6 +114,47 @@ assets/
 - [TESTING.md](TESTING.md)
 - [SECURITY.md](SECURITY.md)
 - [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)
+
+## Plant Encyclopedia
+
+### Extend the offline catalog
+
+File: `assets/plants/catalog.min.json`
+
+Schema:
+
+```json
+{
+  "version": 1,
+  "items": [
+    {"id":"cannabis-sativa","latin":"Cannabis sativa","common":["hemp"],"syn":["c. sativa"]}
+  ]
+}
+```
+
+- `id` should stay stable and slug-like (`lowercase-ascii-with-dashes`).
+- Keep bundle small: names/synonyms only, no images/descriptions.
+
+### NIP-54 wiki integration
+
+- Plant details screen queries relays for NIP-54 wiki events:
+  - `kind: 30818`
+  - `#d = <normalized plant slug>`
+- Client-side ranking only:
+  - prefer curated authors from optional NIP-51 kind `10101` (`p` tags)
+  - prefer curated relays from optional NIP-51 kind `10102` (`r` tags)
+  - fallback to newest (`created_at`)
+- Results are cached locally per slug for 24h with manual refresh support.
+
+### Privacy note
+
+When publishing public diary events, Weedoshi publishes plant references as tags (no encyclopedia payload):
+
+- `["plant", "<slug-or-custom>"]`
+- `["species", "<latin_name>"]` (optional)
+- `["cultivar", "<free_text>"]` (optional)
+- `["breeder", "<free_text>"]` (optional)
+- `["a", "<30818:pubkey:d>"]` (optional NIP-54 pointer)
 
 ## Roadmap
 
