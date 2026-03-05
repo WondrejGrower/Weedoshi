@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter, type Href } from 'expo-router';
 import {
   ActivityIndicator,
   Image,
@@ -21,6 +21,7 @@ import { diaryManager, fetchEventsByIds } from '../../src/lib/diaryManager';
 import { PostMediaRenderer } from '../../src/components/PostMediaRenderer';
 import { shortPubkey } from '../../src/features/home/profileHelpers';
 import { extractMediaFromContent, parseMediaFromEventTags } from '../../src/lib/mediaExtraction';
+import { normalizePlantDTagSlug } from '../../src/lib/plants/catalog';
 
 type DiaryEntryView = {
   eventId: string;
@@ -28,6 +29,7 @@ type DiaryEntryView = {
   addedAt: number;
   authorPubkey: string;
   image?: string;
+  mediaUrls?: string[];
   contentPreview?: string;
   content: NostrEvent | null;
 };
@@ -80,6 +82,7 @@ function getHostLabel(url?: string): string | null {
 
 function getPrimaryMediaUrl(entry: DiaryEntryView): string | undefined {
   if (entry.image) return entry.image;
+  if (entry.mediaUrls && entry.mediaUrls.length > 0) return entry.mediaUrls[0];
   if (entry.content) {
     const tagMedia = parseMediaFromEventTags(entry.content);
     const fromTags = tagMedia.images[0] || tagMedia.videos[0];
@@ -89,6 +92,17 @@ function getPrimaryMediaUrl(entry: DiaryEntryView): string | undefined {
   }
   const previewExtracted = extractMediaFromContent(entry.contentPreview || '');
   return previewExtracted.images[0] || previewExtracted.videos[0];
+}
+
+function getAllMediaUrls(entry: DiaryEntryView): string[] {
+  if (entry.content) {
+    const tagMedia = parseMediaFromEventTags(entry.content);
+    const contentMedia = extractMediaFromContent(entry.content.content || '');
+    return Array.from(new Set([...tagMedia.images, ...tagMedia.videos, ...contentMedia.images, ...contentMedia.videos]));
+  }
+
+  const previewMedia = extractMediaFromContent(entry.contentPreview || '');
+  return Array.from(new Set([...(entry.mediaUrls || []), ...previewMedia.images, ...previewMedia.videos]));
 }
 
 export default function DiaryDetailPage() {
@@ -166,6 +180,7 @@ export default function DiaryDetailPage() {
       addedAt: item.addedAt,
       authorPubkey: item.authorPubkey,
       image: item.image,
+      mediaUrls: item.mediaUrls,
       contentPreview: item.contentPreview,
       content: eventsById[item.eventId] || null,
     }));
@@ -211,9 +226,10 @@ export default function DiaryDetailPage() {
     const seen = new Set<string>();
     const next: string[] = [];
     for (const entry of entries) {
-      if (!entry.image || seen.has(entry.image)) continue;
-      seen.add(entry.image);
-      next.push(entry.image);
+      const url = getPrimaryMediaUrl(entry);
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      next.push(url);
     }
     return next;
   }, [entries]);
@@ -232,6 +248,21 @@ export default function DiaryDetailPage() {
       await loadDiary();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to save edits');
+    }
+  };
+
+  const handleRemoveEntry = async (eventId: string) => {
+    if (!diary) return;
+    try {
+      await diaryStore.removeItemFromDiary(diary.id, eventId);
+      setEntryDrafts((prev) => {
+        const next = { ...prev };
+        delete next[eventId];
+        return next;
+      });
+      await loadDiary();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to remove entry from diary');
     }
   };
 
@@ -287,6 +318,22 @@ export default function DiaryDetailPage() {
               <Text style={styles.metaText}>
                 {(diary.plant || 'Plant not set')} • {(diary.phase || 'Phase not set')}
               </Text>
+              {diary.cultivar ? <Text style={styles.metaText}>Cultivar: {diary.cultivar}</Text> : null}
+              {diary.breeder ? <Text style={styles.metaText}>Breeder: {diary.breeder}</Text> : null}
+              {(diary.plantSlug || diary.plant) ? (
+                <TouchableOpacity
+                  style={styles.smallButton}
+                  onPress={() => {
+                    const slug = normalizePlantDTagSlug(diary.plantSlug || diary.plant || '');
+                    if (!slug) return;
+                    router.push(
+                      `/plant/${encodeURIComponent(slug)}?name=${encodeURIComponent(diary.plant || '')}` as Href
+                    );
+                  }}
+                >
+                  <Text style={styles.smallButtonText}>Plant details</Text>
+                </TouchableOpacity>
+              ) : null}
               <Text style={styles.metaText}>Entries: {diary.items.length}</Text>
               {diary.coverImage ? <Text style={styles.metaText}>Cover: custom image selected</Text> : null}
               {editMode && (
@@ -357,8 +404,10 @@ export default function DiaryDetailPage() {
             {orderedEntries.map((entry) => {
               const parsed = parsePhaseLabel(entry.phaseLabel);
               const draft = entryDrafts[entry.eventId] || parsed;
-              const isCoverCandidate = Boolean(entry.image && coverImageDraft && entry.image === coverImageDraft);
               const mediaUrl = getPrimaryMediaUrl(entry);
+              const mediaUrls = getAllMediaUrls(entry);
+              const fallbackTags = mediaUrls.map((url) => ['url', url] as string[]);
+              const isCoverCandidate = Boolean(mediaUrl && coverImageDraft && mediaUrl === coverImageDraft);
               const mediaHost = getHostLabel(mediaUrl);
               const eventStorage = entry.content ? 'Relay event' : 'Local diary cache';
               return (
@@ -441,15 +490,29 @@ export default function DiaryDetailPage() {
                       </TouchableOpacity>
                     ) : null}
                   </View>
-                  {editMode && entry.image && (
-                    <TouchableOpacity
-                      style={[styles.coverButton, isCoverCandidate && styles.coverButtonActive]}
-                      onPress={() => setCoverImageDraft(entry.image)}
-                    >
-                      <Text style={[styles.coverButtonText, isCoverCandidate && styles.coverButtonTextActive]}>
-                        {isCoverCandidate ? 'Cover selected' : 'Set as cover'}
-                      </Text>
-                    </TouchableOpacity>
+                  {editMode && (
+                    <View style={styles.entryActionRow}>
+                      {mediaUrl ? (
+                        <TouchableOpacity
+                          style={[styles.coverButton, isCoverCandidate && styles.coverButtonActive]}
+                          onPress={() => setCoverImageDraft(mediaUrl)}
+                        >
+                          <Text style={[styles.coverButtonText, isCoverCandidate && styles.coverButtonTextActive]}>
+                            {isCoverCandidate ? 'Cover selected' : 'Set as cover'}
+                          </Text>
+                        </TouchableOpacity>
+                      ) : null}
+                      <TouchableOpacity
+                        style={styles.removeEntryButton}
+                        onPress={() => {
+                          handleRemoveEntry(entry.eventId).catch(() => {
+                            // handled in callback
+                          });
+                        }}
+                      >
+                        <Text style={styles.removeEntryButtonText}>Remove from diary</Text>
+                      </TouchableOpacity>
+                    </View>
                   )}
                   {entry.content ? (
                     <PostMediaRenderer
@@ -463,7 +526,7 @@ export default function DiaryDetailPage() {
                     <View>
                       <PostMediaRenderer
                         content={entry.contentPreview || entry.image || ''}
-                        tags={[]}
+                        tags={fallbackTags}
                         textNumberOfLines={0}
                         imageResizeMode="contain"
                         singleImageHeight={420}
@@ -611,6 +674,21 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#4b5563',
   },
+  smallButton: {
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: '#c6e8d2',
+    borderRadius: 8,
+    backgroundColor: '#ecfdf3',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    alignSelf: 'flex-start',
+  },
+  smallButtonText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#166534',
+  },
   sortRow: {
     marginTop: 10,
     flexDirection: 'row',
@@ -736,6 +814,27 @@ const styles = StyleSheet.create({
   },
   coverButtonTextActive: {
     color: '#1f5d35',
+  },
+  entryActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  removeEntryButton: {
+    alignSelf: 'flex-start',
+    marginBottom: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#d58f86',
+    backgroundColor: '#fff4f2',
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+  },
+  removeEntryButtonText: {
+    fontSize: 11,
+    color: '#9f2d20',
+    fontWeight: '700',
   },
   entryCard: {
     backgroundColor: '#fffefb',

@@ -110,6 +110,8 @@ export default function RootLayout() {
           }}
         >
           <Stack.Screen name="index" />
+          <Stack.Screen name="diary/[id]" />
+          <Stack.Screen name="plant/[slug]" />
         </Stack>
       </GestureHandlerRootView>
     </ErrorBoundary>

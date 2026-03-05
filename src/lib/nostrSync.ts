@@ -8,6 +8,8 @@ import { assertNoSensitiveMaterial } from './securityBaseline';
 import { LocalSigner } from './signers/localSigner';
 import { ensureSignerBoundIdentity, getDefaultSigner, setLocalSignerPrivkey } from './signers/signerManager';
 import type { Signer } from './signers/types';
+import { eventValidator } from './eventValidator';
+import { decodeCustomPlantSlug, encodeCustomPlantSlug, getPlantBySlug } from './plants/catalog';
 
 const DIARY_KIND = 30078;
 const GROWMIES_KIND = 30000;
@@ -16,6 +18,11 @@ export interface RemoteDiary {
   id: string;
   title: string;
   plant?: string;
+  plantSlug?: string;
+  species?: string;
+  cultivar?: string;
+  breeder?: string;
+  plantWikiAPointer?: string;
   phase?: string;
   coverImage?: string;
   createdAt: number;
@@ -59,12 +66,32 @@ async function signUnsignedEvent(unsignedEvent: UnsignedEvent, authState: AuthSt
 
 function buildDiaryUnsignedEvent(diary: Diary, pubkey: string): UnsignedEvent {
   assertNoSensitiveMaterial(diary.title, 'diary.title');
+  if (diary.plant) assertNoSensitiveMaterial(diary.plant, 'diary.plant');
+  if (diary.cultivar) assertNoSensitiveMaterial(diary.cultivar, 'diary.cultivar');
+  if (diary.breeder) assertNoSensitiveMaterial(diary.breeder, 'diary.breeder');
 
   const tags: string[][] = [
     ['d', `diary-${diary.id}`],
     ['title', diary.title],
     ['t', 'weedoshi-diary'],
   ];
+
+  const plantSlug = diary.plantSlug || (diary.plant ? encodeCustomPlantSlug(diary.plant) : undefined);
+  if (plantSlug) {
+    tags.push(['plant', plantSlug]);
+  }
+  if (diary.species) {
+    tags.push(['species', diary.species]);
+  }
+  if (diary.cultivar) {
+    tags.push(['cultivar', diary.cultivar]);
+  }
+  if (diary.breeder) {
+    tags.push(['breeder', diary.breeder]);
+  }
+  if (diary.plantWikiAPointer) {
+    tags.push(['a', diary.plantWikiAPointer]);
+  }
 
   for (const item of diary.items) {
     tags.push(['e', item.eventId]);
@@ -146,9 +173,10 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
       maxWait: 6000,
       label: 'fetch-public-diaries',
     });
+    const validEvents = events.filter((event) => eventValidator.validateEvent(event));
 
     const latestByDiary = new Map<string, NostrEvent>();
-    for (const event of events) {
+    for (const event of validEvents) {
       const dTag = event.tags.find((tag) => tag[0] === 'd')?.[1] || '';
       const diaryId = dTag.replace(/^diary-/, '').trim();
       if (!diaryId) continue;
@@ -161,9 +189,22 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
     const remote: RemoteDiary[] = [];
     for (const [id, event] of latestByDiary) {
       try {
+        const getTagValue = (key: string): string | undefined => {
+          const tag = event.tags.find((entry) => entry[0] === key && typeof entry[1] === 'string');
+          return tag?.[1]?.trim() || undefined;
+        };
+        const plantSlugFromTag = getTagValue('plant');
+        const speciesFromTag = getTagValue('species');
+        const customPlant = plantSlugFromTag ? decodeCustomPlantSlug(plantSlugFromTag) : null;
+        const catalogPlant = plantSlugFromTag ? getPlantBySlug(plantSlugFromTag)?.latin : undefined;
         const parsed = JSON.parse(event.content || '{}') as {
           title?: string;
           plant?: string;
+          plantSlug?: string;
+          species?: string;
+          cultivar?: string;
+          breeder?: string;
+          plantWikiAPointer?: string;
           phase?: string;
           coverImage?: string;
           createdAt?: number;
@@ -189,7 +230,26 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
         remote.push({
           id,
           title: parsed.title?.trim() || id,
-          plant: typeof parsed.plant === 'string' ? parsed.plant.trim() || undefined : undefined,
+          plant:
+            (typeof parsed.plant === 'string' ? parsed.plant.trim() || undefined : undefined) ||
+            customPlant ||
+            catalogPlant ||
+            speciesFromTag,
+          plantSlug:
+            plantSlugFromTag ||
+            (typeof parsed.plantSlug === 'string' ? parsed.plantSlug.trim() || undefined : undefined),
+          species:
+            speciesFromTag ||
+            (typeof parsed.species === 'string' ? parsed.species.trim() || undefined : undefined),
+          cultivar:
+            getTagValue('cultivar') ||
+            (typeof parsed.cultivar === 'string' ? parsed.cultivar.trim() || undefined : undefined),
+          breeder:
+            getTagValue('breeder') ||
+            (typeof parsed.breeder === 'string' ? parsed.breeder.trim() || undefined : undefined),
+          plantWikiAPointer:
+            getTagValue('a') ||
+            (typeof parsed.plantWikiAPointer === 'string' ? parsed.plantWikiAPointer.trim() || undefined : undefined),
           phase: typeof parsed.phase === 'string' ? parsed.phase.trim() || undefined : undefined,
           coverImage: typeof parsed.coverImage === 'string' ? parsed.coverImage.trim() || undefined : undefined,
           createdAt: parsed.createdAt || event.created_at,
@@ -238,8 +298,9 @@ export async function fetchGrowmiesList(pubkey: string, relayUrls: string[]): Pr
       maxWait: 5000,
       label: 'fetch-growmies',
     });
+    const validEvents = events.filter((event) => eventValidator.validateEvent(event));
 
-    const latest = events.sort((a, b) => b.created_at - a.created_at)[0];
+    const latest = validEvents.sort((a, b) => b.created_at - a.created_at)[0];
     if (!latest) return null;
 
     const authors = latest.tags

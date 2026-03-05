@@ -12,6 +12,7 @@ export interface DiaryItemRef {
   createdAt: number;
   contentPreview?: string;
   image?: string;
+  mediaUrls?: string[];
   phaseLabel?: string;
   addedAt: number;
 }
@@ -20,6 +21,11 @@ export interface Diary {
   id: string;
   title: string;
   plant?: string;
+  plantSlug?: string;
+  species?: string;
+  cultivar?: string;
+  breeder?: string;
+  plantWikiAPointer?: string;
   phase?: string;
   coverImage?: string;
   createdAt: number;
@@ -90,13 +96,17 @@ function fromEvent(event: Event): DiaryItemRef {
   const tagMedia = parseMediaFromEventTags(event);
   const textMedia = extractMediaFromContent(event.content || '');
   const firstImage = tagMedia.images[0] || textMedia.images[0];
+  const mediaUrls = Array.from(
+    new Set([...tagMedia.images, ...tagMedia.videos, ...textMedia.images, ...textMedia.videos])
+  );
 
   return {
     eventId: event.id,
     authorPubkey: event.pubkey,
     createdAt: event.created_at,
-    contentPreview: event.content?.slice(0, 220) || '',
+    contentPreview: event.content || '',
     image: firstImage,
+    mediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined,
     addedAt: nowTs(),
   };
 }
@@ -149,13 +159,26 @@ class DiaryStore {
   async createDiary(
     title: string,
     isPublic: boolean = false,
-    details?: { plant?: string; phase?: string }
+    details?: {
+      plant?: string;
+      plantSlug?: string;
+      species?: string;
+      cultivar?: string;
+      breeder?: string;
+      plantWikiAPointer?: string;
+      phase?: string;
+    }
   ): Promise<Diary> {
     const ts = nowTs();
     const diary: Diary = {
       id: diaryIdFromTitle(title),
       title: normalizeTitle(title),
       plant: normalizeOptionalField(details?.plant),
+      plantSlug: normalizeOptionalField(details?.plantSlug),
+      species: normalizeOptionalField(details?.species),
+      cultivar: normalizeOptionalField(details?.cultivar),
+      breeder: normalizeOptionalField(details?.breeder),
+      plantWikiAPointer: normalizeOptionalField(details?.plantWikiAPointer),
       phase: normalizeOptionalField(details?.phase),
       createdAt: ts,
       updatedAt: ts,
@@ -180,7 +203,19 @@ class DiaryStore {
     await this.persist();
   }
 
-  async updateDiaryDetails(id: string, details: { title?: string; plant?: string; phase?: string }): Promise<void> {
+  async updateDiaryDetails(
+    id: string,
+    details: {
+      title?: string;
+      plant?: string;
+      plantSlug?: string;
+      species?: string;
+      cultivar?: string;
+      breeder?: string;
+      plantWikiAPointer?: string;
+      phase?: string;
+    }
+  ): Promise<void> {
     const diary = this.getDiary(id);
     if (!diary) return;
 
@@ -189,6 +224,21 @@ class DiaryStore {
     }
     if (typeof details.plant === 'string') {
       diary.plant = normalizeOptionalField(details.plant);
+    }
+    if (typeof details.plantSlug === 'string') {
+      diary.plantSlug = normalizeOptionalField(details.plantSlug);
+    }
+    if (typeof details.species === 'string') {
+      diary.species = normalizeOptionalField(details.species);
+    }
+    if (typeof details.cultivar === 'string') {
+      diary.cultivar = normalizeOptionalField(details.cultivar);
+    }
+    if (typeof details.breeder === 'string') {
+      diary.breeder = normalizeOptionalField(details.breeder);
+    }
+    if (typeof details.plantWikiAPointer === 'string') {
+      diary.plantWikiAPointer = normalizeOptionalField(details.plantWikiAPointer);
     }
     if (typeof details.phase === 'string') {
       diary.phase = normalizeOptionalField(details.phase);
@@ -361,6 +411,11 @@ class DiaryStore {
 
     existing.title = remote.title;
     existing.plant = normalizeOptionalField(remote.plant);
+    existing.plantSlug = normalizeOptionalField(remote.plantSlug);
+    existing.species = normalizeOptionalField(remote.species);
+    existing.cultivar = normalizeOptionalField(remote.cultivar);
+    existing.breeder = normalizeOptionalField(remote.breeder);
+    existing.plantWikiAPointer = normalizeOptionalField(remote.plantWikiAPointer);
     existing.phase = normalizeOptionalField(remote.phase);
     existing.coverImage = normalizeImageUrl(remote.coverImage);
     existing.items = remote.items;

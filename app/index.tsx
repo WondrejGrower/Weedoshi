@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { useRouter } from 'expo-router';
+import { useRouter, type Href } from 'expo-router';
 import {
   View,
   Text,
@@ -25,6 +25,7 @@ import { ReactionBar } from '../src/components/ReactionBar';
 import { ThreadIndicator } from '../src/components/ThreadIndicator';
 import { SmartRelayPanel } from '../src/components/SmartRelayPanel';
 import { PostMediaRenderer } from '../src/components/PostMediaRenderer';
+import { PlantPicker } from '../src/components/PlantPicker';
 import { reactionManager } from '../src/lib/reactionManager';
 import type { NostrProfileMetadata } from '../src/lib/nostrClient';
 import type { AuthState, Nip46PairingState } from '../src/lib/authManager';
@@ -50,6 +51,8 @@ import { assertNoSensitiveMaterial } from '../src/lib/securityBaseline';
 import { getAllHashtags } from '../src/lib/eventFilter';
 import { getJson, setJson } from '../src/lib/persistentStorage';
 import { extractMediaFromContent } from '../src/lib/mediaExtraction';
+import { normalizePlantDTagSlug } from '../src/lib/plants/catalog';
+import type { PlantSelection } from '../src/lib/plants/types';
 
 const runtimeMode = getRuntimeMode();
 const features = getFeatures(runtimeMode);
@@ -58,6 +61,7 @@ type MainPage = 'feed' | 'profile' | 'growmies' | 'settings';
 type ProfileTab = 'diary' | 'all';
 type SettingsSection = 'authentication' | 'relays' | 'hashtags' | 'growmies';
 const LOGIN_PROMPT_DISMISSED_KEY = 'login_prompt_dismissed_v1';
+const ANONYMOUS_BROWSING_ENABLED_KEY = 'anonymous_browsing_enabled_v1';
 const PHASE_TEMPLATE_OPTIONS = ['Seedling', 'Vegetation', 'Flowering', 'Harvest'];
 
 function getDiaryCoverForCard(diary: Diary): string | undefined {
@@ -92,6 +96,7 @@ export default function HomeScreen() {
   const [loginPromptDismissed, setLoginPromptDismissed] = useState(false);
   const [loginPromptLoaded, setLoginPromptLoaded] = useState(false);
   const [loginPromptMenuOpen, setLoginPromptMenuOpen] = useState(false);
+  const [anonymousBrowsingEnabled, setAnonymousBrowsingEnabled] = useState(false);
   const settingsMenuAnim = useRef(new Animated.Value(0)).current;
 
   const [authState, setAuthState] = useState<AuthState>(authManager.getState());
@@ -127,6 +132,12 @@ export default function HomeScreen() {
   const [diaryEditMode, setDiaryEditMode] = useState(false);
   const [diarySnapshot, setDiarySnapshot] = useState<DiaryIndex | null>(null);
   const [diaryPlantInput, setDiaryPlantInput] = useState('');
+  const [diaryPlantSlug, setDiaryPlantSlug] = useState('');
+  const [diarySpeciesInput, setDiarySpeciesInput] = useState('');
+  const [diaryCultivarInput, setDiaryCultivarInput] = useState('');
+  const [diaryBreederInput, setDiaryBreederInput] = useState('');
+  const [diaryPlantWikiAPointer, setDiaryPlantWikiAPointer] = useState('');
+  const [diaryMoreOpen, setDiaryMoreOpen] = useState(false);
   const [diaryPhaseInput, setDiaryPhaseInput] = useState('');
 
   const [profileLoading, setProfileLoading] = useState(false);
@@ -146,6 +157,7 @@ export default function HomeScreen() {
   const [profileHashtagFilterEnabled, setProfileHashtagFilterEnabled] = useState(false);
   const [profileHashtags, setProfileHashtags] = useState<string[]>([]);
   const [newProfileHashtag, setNewProfileHashtag] = useState('');
+  const [diaryTileAspectById, setDiaryTileAspectById] = useState<Record<string, number>>({});
   const {
     events,
     isLoading,
@@ -166,10 +178,14 @@ export default function HomeScreen() {
 
   useEffect(() => {
     let canceled = false;
-    getJson<boolean>(LOGIN_PROMPT_DISMISSED_KEY, false)
-      .then((value) => {
+    Promise.all([
+      getJson<boolean>(LOGIN_PROMPT_DISMISSED_KEY, false),
+      getJson<boolean>(ANONYMOUS_BROWSING_ENABLED_KEY, false),
+    ])
+      .then(([promptDismissed, anonymousEnabled]) => {
         if (canceled) return;
-        setLoginPromptDismissed(Boolean(value));
+        setLoginPromptDismissed(Boolean(promptDismissed));
+        setAnonymousBrowsingEnabled(Boolean(anonymousEnabled));
       })
       .finally(() => {
         if (canceled) return;
@@ -199,6 +215,20 @@ export default function HomeScreen() {
     await setJson(LOGIN_PROMPT_DISMISSED_KEY, true);
   }, []);
 
+  const enableAnonymousBrowsing = useCallback(async () => {
+    setAnonymousBrowsingEnabled(true);
+    await setJson(ANONYMOUS_BROWSING_ENABLED_KEY, true);
+    await persistLoginPromptDismissed();
+    setLoginPromptMenuOpen(false);
+    setActivePage('feed');
+    setSettingsSection('authentication');
+  }, [persistLoginPromptDismissed]);
+
+  const disableAnonymousBrowsing = useCallback(async () => {
+    setAnonymousBrowsingEnabled(false);
+    await setJson(ANONYMOUS_BROWSING_ENABLED_KEY, false);
+  }, []);
+
   const refreshNip46PairingState = useCallback(async () => {
     const state = await authManager.getNip46PairingState();
     setNip46PairingState(state);
@@ -216,6 +246,13 @@ export default function HomeScreen() {
       // best-effort persistence only
     });
   }, [authState.isLoggedIn, loginPromptDismissed, persistLoginPromptDismissed]);
+
+  useEffect(() => {
+    if (!loginPromptLoaded) return;
+    if (authState.isLoggedIn) return;
+    if (!anonymousBrowsingEnabled) return;
+    setActivePage('feed');
+  }, [authState.isLoggedIn, anonymousBrowsingEnabled, loginPromptLoaded]);
 
   const hydrateDiaryStateFromStore = useCallback(async (preferredDiaryId?: string) => {
     const diaries = diaryStore.listDiaries();
@@ -239,6 +276,11 @@ export default function HomeScreen() {
       setDiaryIdInput(defaultDiaryId());
       setDiaryTitleInput('My Grow Run #1');
       setDiaryPlantInput('');
+      setDiaryPlantSlug('');
+      setDiarySpeciesInput('');
+      setDiaryCultivarInput('');
+      setDiaryBreederInput('');
+      setDiaryPlantWikiAPointer('');
       setDiaryPhaseInput('');
       return;
     }
@@ -264,7 +306,13 @@ export default function HomeScreen() {
     setDiaryIdInput(selected.id);
     setDiaryTitleInput(selected.title);
     setDiaryPlantInput(selected.plant || '');
+    setDiaryPlantSlug(selected.plantSlug || '');
+    setDiarySpeciesInput(selected.species || '');
+    setDiaryCultivarInput(selected.cultivar || '');
+    setDiaryBreederInput(selected.breeder || '');
+    setDiaryPlantWikiAPointer(selected.plantWikiAPointer || '');
     setDiaryPhaseInput(selected.phase || '');
+    setDiaryMoreOpen(false);
 
   }, [relayUrls]);
 
@@ -434,10 +482,10 @@ export default function HomeScreen() {
       setAddToDiaryModalOpen(false);
       setAddToDiaryEvent(null);
       setError(null);
-      router.push({
-        pathname: '/diary/[id]' as any,
-        params: { id: targetId, entryId: eventIdToOpen } as any,
-      });
+      const path = eventIdToOpen
+        ? `/diary/${encodeURIComponent(targetId)}?entryId=${encodeURIComponent(eventIdToOpen)}`
+        : `/diary/${encodeURIComponent(targetId)}`;
+      router.push(path as Href);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add post to diary');
     }
@@ -465,9 +513,17 @@ export default function HomeScreen() {
     setDiaryPublishing(true);
     try {
       assertNoSensitiveMaterial(diaryTitleInput, 'diary title');
+      if (!diaryPlantInput.trim()) {
+        throw new Error('Plant is required. Select from Plant search or use Custom.');
+      }
       await diaryStore.updateDiaryDetails(diaryDraft.diaryId, {
         title: diaryTitleInput,
         plant: diaryPlantInput,
+        plantSlug: diaryPlantSlug,
+        species: diarySpeciesInput,
+        cultivar: diaryCultivarInput,
+        breeder: diaryBreederInput,
+        plantWikiAPointer: diaryPlantWikiAPointer,
         phase: diaryPhaseInput,
       });
       await diaryStore.setDiaryItemOrder(
@@ -505,17 +561,22 @@ export default function HomeScreen() {
       return;
     }
     const proposedTitle = diaryTitleInput.trim() || `My Grow Run #${runOptions.length + 1}`;
+    if (!diaryPlantInput.trim()) {
+      throw new Error('Plant is required. Select from Plant search or use Custom.');
+    }
     const created = await diaryStore.createDiary(proposedTitle, false, {
       plant: diaryPlantInput,
+      plantSlug: diaryPlantSlug,
+      species: diarySpeciesInput,
+      cultivar: diaryCultivarInput,
+      breeder: diaryBreederInput,
+      plantWikiAPointer: diaryPlantWikiAPointer,
       phase: diaryPhaseInput,
     });
     await hydrateDiaryStateFromStore(created.id);
     setDiaryEditMode(false);
     setDiarySnapshot(null);
-    router.push({
-      pathname: '/diary/[id]' as any,
-      params: { id: created.id } as any,
-    });
+    router.push(`/diary/${encodeURIComponent(created.id)}` as Href);
   };
 
   const handleOpenDiaryEditor = async () => {
@@ -527,10 +588,7 @@ export default function HomeScreen() {
       await handleCreateDiary();
       return;
     }
-    router.push({
-      pathname: '/diary/[id]' as any,
-      params: { id: diaryDraft.diaryId } as any,
-    });
+    router.push(`/diary/${encodeURIComponent(diaryDraft.diaryId)}` as Href);
   };
 
   const handleSelectRun = (run: DiaryRunOption) => {
@@ -555,6 +613,7 @@ export default function HomeScreen() {
       }
       const newState = authManager.getState();
       setAuthState(newState);
+      await disableAnonymousBrowsing();
       setNsecInput('');
       setNpubInput('');
       refreshSignerAvailability();
@@ -574,6 +633,7 @@ export default function HomeScreen() {
       await authManager.loginWithSignerFirst();
       const newState = authManager.getState();
       setAuthState(newState);
+      await disableAnonymousBrowsing();
       refreshSignerAvailability();
       await refreshNip46PairingState();
       if (newState.pubkey) {
@@ -591,6 +651,7 @@ export default function HomeScreen() {
       await authManager.connectNip46Session();
       const newState = authManager.getState();
       setAuthState(newState);
+      await disableAnonymousBrowsing();
       refreshSignerAvailability();
       await refreshNip46PairingState();
       if (newState.pubkey) {
@@ -668,6 +729,7 @@ export default function HomeScreen() {
   const handleLogout = async () => {
     await authManager.logout();
     setAuthState(authManager.getState());
+    await enableAnonymousBrowsing();
     refreshSignerAvailability();
     await refreshNip46PairingState();
     setDiaryEditMode(false);
@@ -737,6 +799,25 @@ export default function HomeScreen() {
     setProfileHashtags((prev) => prev.filter((item) => item !== tag));
   };
 
+  const handlePlantSelection = (selection: PlantSelection) => {
+    setDiaryPlantInput(selection.displayName);
+    setDiaryPlantSlug(selection.slug);
+    setDiarySpeciesInput(selection.latinName || '');
+    if (selection.isCustom) {
+      setDiaryPlantWikiAPointer('');
+    }
+  };
+
+  const handleOpenPlantDetails = () => {
+    const sourceSlug = diaryPlantSlug || diaryPlantInput;
+    const slug = normalizePlantDTagSlug(sourceSlug);
+    if (!slug) {
+      setError('Select plant first to open details.');
+      return;
+    }
+    router.push(`/plant/${encodeURIComponent(slug)}?name=${encodeURIComponent(diaryPlantInput || '')}` as Href);
+  };
+
   const handleRefresh = () => {
     setError(null);
     refreshFeed();
@@ -748,12 +829,27 @@ export default function HomeScreen() {
       await diaryStore.updateDiaryDetails(diaryDraft.diaryId, {
         title: diaryTitleInput,
         plant: diaryPlantInput,
+        plantSlug: diaryPlantSlug,
+        species: diarySpeciesInput,
+        cultivar: diaryCultivarInput,
+        breeder: diaryBreederInput,
+        plantWikiAPointer: diaryPlantWikiAPointer,
         phase: diaryPhaseInput,
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save diary details');
     }
-  }, [diaryDraft, diaryTitleInput, diaryPlantInput, diaryPhaseInput]);
+  }, [
+    diaryDraft,
+    diaryTitleInput,
+    diaryPlantInput,
+    diaryPlantSlug,
+    diarySpeciesInput,
+    diaryCultivarInput,
+    diaryBreederInput,
+    diaryPlantWikiAPointer,
+    diaryPhaseInput,
+  ]);
 
   const feedHashtagsKey = useMemo(() => hashtags.join('|'), [hashtags]);
   useEffect(() => {
@@ -799,13 +895,20 @@ export default function HomeScreen() {
     return events.filter((event) => allowed.has(event.author));
   }, [events, onlyGrowmies, growmies]);
 
+  const getDiaryTileResizeMode = useCallback((diaryId: string): 'cover' | 'contain' => {
+    const aspect = diaryTileAspectById[diaryId];
+    if (!aspect) return 'cover';
+    // Portrait-heavy images keep full subject visibility, landscape images keep visual fill.
+    return aspect < 0.82 ? 'contain' : 'cover';
+  }, [diaryTileAspectById]);
+
   const visibleProfilePosts = useMemo(() => {
     if (!profileHashtagFilterEnabled || profileHashtags.length === 0) {
       return profilePosts;
     }
     const selected = new Set(profileHashtags.map((tag) => tag.toLowerCase()));
     return profilePosts.filter((post) => {
-      const tags = getAllHashtags(post as any);
+      const tags = getAllHashtags(post);
       return tags.some((tag) => selected.has(tag.toLowerCase()));
     });
   }, [profileHashtagFilterEnabled, profileHashtags, profilePosts]);
@@ -848,7 +951,7 @@ export default function HomeScreen() {
         onReactionAdded={() => {
           setTimeout(() => {
             const eventIds = events.map((e) => e.id);
-            reactionManager.fetchReactions(eventIds, relayUrls).catch((err) => {
+            reactionManager.fetchInteractions(eventIds, relayUrls).catch((err) => {
               logger.warn('Failed to refresh reactions:', err);
             });
           }, 500);
@@ -1060,6 +1163,20 @@ export default function HomeScreen() {
                     <Text style={styles.profileStatValue}>{runOptions.length}</Text>
                     <Text style={styles.profileStatLabel}>Diaries</Text>
                   </View>
+                  <TouchableOpacity
+                    style={[
+                      styles.profileStatActionPill,
+                      authState.isReadOnly && styles.profileStatActionPillDisabled,
+                    ]}
+                    onPress={() => {
+                      handleOpenDiaryEditor().catch((err) => {
+                        setError(err instanceof Error ? err.message : 'Failed to open diary editor');
+                      });
+                    }}
+                    disabled={authState.isReadOnly}
+                  >
+                    <Text style={styles.profileStatActionText}>Add diary</Text>
+                  </TouchableOpacity>
                   <View style={styles.profileStatPill}>
                     <Text style={styles.profileStatValue}>{profilePosts.length}</Text>
                     <Text style={styles.profileStatLabel}>Notes</Text>
@@ -1073,27 +1190,23 @@ export default function HomeScreen() {
                     <Text style={styles.profileStatLabel}>Nostr since</Text>
                   </View>
                 </View>
+                {authState.isLoggedIn && (
+                  <View style={styles.profileQuickActions}>
+                    <TouchableOpacity style={styles.buttonSecondary} onPress={handleLogout}>
+                      <Text style={styles.buttonText}>Logout to Anonymous</Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
               </View>
             </View>
 
-            <View style={styles.diaryHeaderActions}>
-              <TouchableOpacity
-                style={styles.smallButton}
-                onPress={() => {
-                  handleOpenDiaryEditor().catch((err) => {
-                    setError(err instanceof Error ? err.message : 'Failed to open diary editor');
-                  });
-                }}
-                disabled={authState.isReadOnly}
-              >
-                <Text style={styles.buttonText}>Add diary</Text>
-              </TouchableOpacity>
-              {diaryEditMode && (
+            {diaryEditMode && (
+              <View style={styles.diaryHeaderActions}>
                 <TouchableOpacity style={styles.ghostButton} onPress={handleCancelEdit}>
                   <Text style={styles.ghostButtonText}>Close editor</Text>
                 </TouchableOpacity>
-              )}
-            </View>
+              </View>
+            )}
             {diaryEditMode && (
               <>
                 <View style={styles.runSelectorRow}>
@@ -1123,18 +1236,70 @@ export default function HomeScreen() {
                   <View style={styles.diaryDetailRow}>
                     <View style={[styles.diaryDetailField, styles.diaryDetailFieldHalf]}>
                       <Text style={styles.diaryDetailLabel}>Plant</Text>
-                      <TextInput
-                        style={styles.diaryDetailInput}
-                        value={diaryPlantInput}
-                        onChangeText={setDiaryPlantInput}
-                        onBlur={() => {
+                      <PlantPicker
+                        valueSlug={diaryPlantSlug}
+                        valueName={diaryPlantInput}
+                        onChange={(selection) => {
+                          handlePlantSelection(selection);
                           persistDiaryDetails().catch(() => {
                             // error handled in callback
                           });
                         }}
-                        placeholder="e.g. Blue Dream"
-                        placeholderTextColor="#9ca3af"
                       />
+                      <View style={styles.plantActionsRow}>
+                        <TouchableOpacity style={styles.smallButton} onPress={handleOpenPlantDetails}>
+                          <Text style={styles.buttonText}>Plant details</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={styles.buttonSecondary}
+                          onPress={() => setDiaryMoreOpen((prev) => !prev)}
+                        >
+                          <Text style={styles.buttonText}>{diaryMoreOpen ? 'Less' : 'More'}</Text>
+                        </TouchableOpacity>
+                      </View>
+                      {diaryMoreOpen && (
+                        <View style={styles.plantMoreWrap}>
+                          <Text style={styles.diaryDetailLabel}>Cultivar / Strain</Text>
+                          <TextInput
+                            style={styles.diaryDetailInput}
+                            value={diaryCultivarInput}
+                            onChangeText={setDiaryCultivarInput}
+                            onBlur={() => {
+                              persistDiaryDetails().catch(() => {
+                                // error handled in callback
+                              });
+                            }}
+                            placeholder="Optional cultivar/strain"
+                            placeholderTextColor="#9ca3af"
+                          />
+                          <Text style={styles.diaryDetailLabel}>Breeder</Text>
+                          <TextInput
+                            style={styles.diaryDetailInput}
+                            value={diaryBreederInput}
+                            onChangeText={setDiaryBreederInput}
+                            onBlur={() => {
+                              persistDiaryDetails().catch(() => {
+                                // error handled in callback
+                              });
+                            }}
+                            placeholder="Optional breeder"
+                            placeholderTextColor="#9ca3af"
+                          />
+                          <Text style={styles.diaryDetailLabel}>Wiki article pointer (a)</Text>
+                          <TextInput
+                            style={styles.diaryDetailInput}
+                            value={diaryPlantWikiAPointer}
+                            onChangeText={setDiaryPlantWikiAPointer}
+                            onBlur={() => {
+                              persistDiaryDetails().catch(() => {
+                                // error handled in callback
+                              });
+                            }}
+                            placeholder="30818:<pubkey>:<d-tag>"
+                            placeholderTextColor="#9ca3af"
+                          />
+                        </View>
+                      )}
                     </View>
                     <View style={[styles.diaryDetailField, styles.diaryDetailFieldHalf]}>
                       <Text style={styles.diaryDetailLabel}>Phase</Text>
@@ -1292,15 +1457,25 @@ export default function HomeScreen() {
                         (hovered || pressed) && styles.diaryTileCardHover,
                       ]}
                       onPress={() => {
-                        router.push({
-                          pathname: '/diary/[id]' as any,
-                          params: { id: diary.id } as any,
-                        });
+                        router.push(`/diary/${encodeURIComponent(diary.id)}` as Href);
                       }}
                     >
                       {imageUri ? (
                         <View style={styles.diaryTileImageWrap}>
-                          <Image source={{ uri: imageUri }} style={styles.diaryTileImage} resizeMode="cover" />
+                          <Image
+                            source={{ uri: imageUri }}
+                            style={styles.diaryTileImage}
+                            resizeMode={getDiaryTileResizeMode(diary.id)}
+                            onLoad={(evt) => {
+                              const source = evt.nativeEvent?.source;
+                              if (!source?.width || !source?.height) return;
+                              const aspect = source.width / source.height;
+                              setDiaryTileAspectById((prev) => {
+                                if (prev[diary.id] === aspect) return prev;
+                                return { ...prev, [diary.id]: aspect };
+                              });
+                            }}
+                          />
                           <View pointerEvents="none" style={styles.diaryTileImageShade} />
                           {diary.coverImage ? (
                             <View style={styles.diaryTileCoverBadge}>
@@ -1493,11 +1668,16 @@ export default function HomeScreen() {
               </TouchableOpacity>
             )}
             <TouchableOpacity style={styles.button} onPress={handleLogout}>
-              <Text style={styles.buttonText}>Logout</Text>
+              <Text style={styles.buttonText}>Logout & Browse Anonymous</Text>
             </TouchableOpacity>
           </View>
         ) : (
           <View>
+            {anonymousBrowsingEnabled && (
+              <Text style={styles.signerHint}>
+                Anonymous mode active: feed browsing is enabled without login.
+              </Text>
+            )}
             {runtimeMode === 'web' ? (
               <View>
                 <Text style={styles.statusText}>Web mode prefers browser signer auth.</Text>
@@ -1580,6 +1760,9 @@ export default function HomeScreen() {
                 <TouchableOpacity style={styles.buttonSecondary} onPress={handleLogin}>
                   <Text style={styles.buttonText}>Continue Read-only</Text>
                 </TouchableOpacity>
+                <TouchableOpacity style={styles.buttonSecondary} onPress={enableAnonymousBrowsing}>
+                  <Text style={styles.buttonText}>Browse as Anonymous</Text>
+                </TouchableOpacity>
               </View>
             ) : (
               <View>
@@ -1635,6 +1818,9 @@ export default function HomeScreen() {
                   <Text style={styles.buttonText}>
                     {activeAuthTab === 'nsec' ? 'Login with Local Signer' : 'Continue Read-only'}
                   </Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.buttonSecondary} onPress={enableAnonymousBrowsing}>
+                  <Text style={styles.buttonText}>Browse as Anonymous</Text>
                 </TouchableOpacity>
               </View>
             )}
@@ -2061,8 +2247,7 @@ export default function HomeScreen() {
               <TouchableOpacity
                 style={[styles.loginPromptMenuItem, styles.loginPromptMenuItemLast]}
                 onPress={() => {
-                  setLoginPromptMenuOpen(false);
-                  persistLoginPromptDismissed().catch(() => {
+                  enableAnonymousBrowsing().catch(() => {
                     // best-effort persistence only
                   });
                 }}
@@ -2160,10 +2345,10 @@ const styles = StyleSheet.create({
   },
   pageInner: {
     width: '100%',
-    maxWidth: 860,
+    maxWidth: 1080,
     alignSelf: 'center',
-    paddingHorizontal: 18,
-    paddingTop: 10,
+    paddingHorizontal: 14,
+    paddingTop: 6,
     paddingBottom: 16,
   },
   pageInnerMobile: {
@@ -2286,9 +2471,9 @@ const styles = StyleSheet.create({
   profileHeaderCard: {
     backgroundColor: '#fffdf8',
     borderRadius: 14,
-    paddingBottom: 16,
-    marginBottom: 12,
-    marginTop: 8,
+    paddingBottom: 14,
+    marginBottom: 8,
+    marginTop: 4,
     borderWidth: 1,
     borderColor: '#e1d1ae',
     overflow: 'hidden',
@@ -2304,13 +2489,13 @@ const styles = StyleSheet.create({
   },
   profileBannerWrap: {
     width: '100%',
-    height: 268,
+    height: 244,
     overflow: 'hidden',
     borderTopLeftRadius: 14,
     borderTopRightRadius: 14,
   },
   profileBannerWrapMobile: {
-    height: 206,
+    height: 192,
   },
   profileBannerImage: {
     width: '100%',
@@ -2330,29 +2515,29 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.42)',
   },
   profileHeaderContent: {
-    marginTop: -42,
-    paddingHorizontal: 16,
+    marginTop: -36,
+    paddingHorizontal: 18,
     paddingTop: 0,
   },
   profileHeaderContentMobile: {
-    marginTop: -30,
+    marginTop: -24,
     paddingHorizontal: 12,
   },
   brandPlaqueInline: {
     alignSelf: 'flex-start',
     marginLeft: 2,
-    marginBottom: 8,
-    borderRadius: 18,
+    marginBottom: 4,
+    borderRadius: 16,
     overflow: 'hidden',
   },
   brandPlaqueInlineMobile: {
     marginLeft: 8,
   },
   brandPlaqueImage: {
-    width: 376,
-    height: 172,
-    borderRadius: 18,
-    opacity: 0.88,
+    width: 286,
+    height: 124,
+    borderRadius: 16,
+    opacity: 0.9,
   },
   profileHeaderRow: {
     flexDirection: 'row',
@@ -2444,6 +2629,11 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     gap: 8,
     marginTop: 12,
+    alignItems: 'center',
+  },
+  profileQuickActions: {
+    marginTop: 10,
+    alignItems: 'flex-start',
   },
   profileStatPill: {
     borderWidth: 1,
@@ -2465,11 +2655,31 @@ const styles = StyleSheet.create({
     color: '#967a47',
     marginTop: 2,
   },
+  profileStatActionPill: {
+    borderWidth: 1,
+    borderColor: '#7cb08a',
+    backgroundColor: '#2e7044',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    minWidth: 88,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  profileStatActionPillDisabled: {
+    opacity: 0.6,
+  },
+  profileStatActionText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#f5fff8',
+  },
   diaryHeaderActions: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
     paddingHorizontal: 16,
+    justifyContent: 'flex-end',
     marginBottom: 8,
   },
   runSelectorRow: {
@@ -2573,6 +2783,22 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#111827',
   },
+  plantActionsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 7,
+    alignItems: 'center',
+    flexWrap: 'wrap',
+  },
+  plantMoreWrap: {
+    marginTop: 8,
+    gap: 6,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 8,
+    padding: 8,
+    backgroundColor: '#f9fafb',
+  },
   phaseTemplatesRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -2661,22 +2887,6 @@ const styles = StyleSheet.create({
     marginBottom: 18,
     lineHeight: 20,
   },
-  chapterSection: {
-    marginBottom: 14,
-  },
-  chapterTitle: {
-    fontSize: 12,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-    color: '#4b5563',
-    letterSpacing: 0.8,
-  },
-  chapterDivider: {
-    marginTop: 6,
-    marginBottom: 8,
-    height: 1,
-    backgroundColor: '#e5e7eb',
-  },
   diaryCard: {
     backgroundColor: '#fffefb',
     borderRadius: 12,
@@ -2690,50 +2900,29 @@ const styles = StyleSheet.create({
     shadowRadius: 3,
     elevation: 1,
   },
-  diaryCardHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  diaryCardDate: {
-    fontSize: 11,
-    color: '#6b7280',
-    fontWeight: '400',
-  },
-  diaryCardMenu: {
-    fontSize: 18,
-    color: '#6b7280',
-    lineHeight: 20,
-  },
-  diaryCardText: {
-    marginTop: 8,
-    fontSize: 13,
-    color: '#1f2937',
-    lineHeight: 19,
-  },
   diaryTilesGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 10,
+    gap: 12,
     marginBottom: 14,
   },
   diaryTileCard: {
     backgroundColor: '#fffefb',
-    borderRadius: 12,
+    borderRadius: 14,
     borderWidth: 1,
     borderColor: '#e1d5bc',
     overflow: 'hidden',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.05,
-    shadowRadius: 3,
-    elevation: 1,
+    shadowRadius: 5,
+    elevation: 2,
   },
   diaryTileCardDesktop: {
-    width: '31.8%',
+    width: '32.5%',
   },
   diaryTileCardMobile: {
-    width: '48%',
+    width: '48.5%',
   },
   diaryTileCardHover: {
     borderColor: '#86efac',
@@ -2747,16 +2936,16 @@ const styles = StyleSheet.create({
   },
   diaryTileImage: {
     width: '100%',
-    height: 128,
-    backgroundColor: '#d1d5db',
+    height: 190,
+    backgroundColor: '#1f2e22',
   },
   diaryTileImageShade: {
     position: 'absolute',
     left: 0,
     right: 0,
     bottom: 0,
-    height: 56,
-    backgroundColor: 'rgba(0,0,0,0.24)',
+    height: 62,
+    backgroundColor: 'rgba(0,0,0,0.18)',
   },
   diaryTileCoverBadge: {
     position: 'absolute',
@@ -2774,7 +2963,7 @@ const styles = StyleSheet.create({
   },
   diaryTileImageFallback: {
     width: '100%',
-    height: 128,
+    height: 190,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: '#f3f4f6',
@@ -2785,138 +2974,24 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   diaryTileMeta: {
-    paddingHorizontal: 10,
-    paddingVertical: 9,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
   },
   diaryTileTitle: {
-    fontSize: 13,
+    fontSize: 14,
     color: '#111827',
     fontWeight: '700',
   },
   diaryTileSub: {
-    marginTop: 2,
-    fontSize: 11,
+    marginTop: 3,
+    fontSize: 12,
     color: '#2b6a3c',
     fontWeight: '600',
   },
   diaryTileDate: {
-    marginTop: 4,
-    fontSize: 10,
-    color: '#6b7280',
-  },
-  diaryEditRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 12,
-    flexWrap: 'wrap',
-  },
-  iconButton: {
-    width: 30,
-    height: 30,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: '#d8ccb3',
-    backgroundColor: '#fffdf8',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  iconButtonText: {
-    color: '#374151',
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  entryPhaseInlineWrap: {
-    flex: 1,
-    minWidth: 170,
-  },
-  entryPhaseInlineLabel: {
-    fontSize: 10,
-    color: '#6b7280',
-    marginBottom: 3,
-    fontWeight: '600',
-  },
-  entryPhaseSplitRow: {
-    flexDirection: 'row',
-    gap: 6,
-  },
-  entryPhaseInlineInput: {
-    borderWidth: 1,
-    borderColor: '#d8ccb4',
-    borderRadius: 8,
-    backgroundColor: '#fffdf8',
-    paddingHorizontal: 9,
-    paddingVertical: 6,
-    fontSize: 12,
-    color: '#111827',
-  },
-  entryPhaseInlineInputHalf: {
-    flex: 1,
-    minWidth: 110,
-  },
-  entryPhaseInlineInputWeek: {
-    width: 86,
-  },
-  entryPhaseTemplatesRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-    marginTop: 6,
-  },
-  entryPhaseTemplateChip: {
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#d9c592',
-    backgroundColor: '#f7f2e6',
-  },
-  entryPhaseTemplateChipActive: {
-    borderColor: '#2f6b3f',
-    backgroundColor: '#e5efdf',
-  },
-  entryPhaseTemplateChipText: {
-    fontSize: 10,
-    color: '#2f6b3f',
-    fontWeight: '600',
-  },
-  entryPhaseTemplateChipTextActive: {
-    color: '#065f46',
-  },
-  iconDangerButton: {
-    width: 30,
-    height: 30,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: '#fecaca',
-    backgroundColor: '#fff5f5',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  iconDangerText: {
-    color: '#b91c1c',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  coverPickButton: {
-    borderWidth: 1,
-    borderColor: '#d4be8e',
-    backgroundColor: '#f8f4ea',
-    borderRadius: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    alignSelf: 'flex-start',
-  },
-  coverPickButtonActive: {
-    borderColor: '#059669',
-    backgroundColor: '#d1fae5',
-  },
-  coverPickButtonText: {
+    marginTop: 5,
     fontSize: 11,
-    color: '#2f6b3f',
-    fontWeight: '700',
-  },
-  coverPickButtonTextActive: {
-    color: '#065f46',
+    color: '#6b7280',
   },
   stickyBar: {
     position: 'absolute',
