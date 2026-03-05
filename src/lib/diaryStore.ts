@@ -37,6 +37,17 @@ export interface Diary {
   items: DiaryItemRef[];
 }
 
+export interface DiaryDetailsInput {
+  title?: string;
+  plant?: string;
+  plantSlug?: string;
+  species?: string;
+  cultivar?: string;
+  breeder?: string;
+  plantWikiAPointer?: string;
+  phase?: string;
+}
+
 interface DiaryStoreState {
   diaries: Diary[];
   selectedDiaryId: string | null;
@@ -159,15 +170,7 @@ class DiaryStore {
   async createDiary(
     title: string,
     isPublic: boolean = false,
-    details?: {
-      plant?: string;
-      plantSlug?: string;
-      species?: string;
-      cultivar?: string;
-      breeder?: string;
-      plantWikiAPointer?: string;
-      phase?: string;
-    }
+    details?: DiaryDetailsInput
   ): Promise<Diary> {
     const ts = nowTs();
     const diary: Diary = {
@@ -205,16 +208,7 @@ class DiaryStore {
 
   async updateDiaryDetails(
     id: string,
-    details: {
-      title?: string;
-      plant?: string;
-      plantSlug?: string;
-      species?: string;
-      cultivar?: string;
-      breeder?: string;
-      plantWikiAPointer?: string;
-      phase?: string;
-    }
+    details: DiaryDetailsInput
   ): Promise<void> {
     const diary = this.getDiary(id);
     if (!diary) return;

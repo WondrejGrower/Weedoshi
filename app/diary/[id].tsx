@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocalSearchParams, useRouter, type Href } from 'expo-router';
 import {
   ActivityIndicator,
+  Alert,
   Image,
   Linking,
   Pressable,
@@ -15,13 +16,16 @@ import {
 } from 'react-native';
 import type { Event as NostrEvent } from 'nostr-tools';
 import { authManager } from '../../src/lib/authManager';
-import { diaryStore, type Diary } from '../../src/lib/diaryStore';
+import { diaryStore, type Diary, type DiaryDetailsInput } from '../../src/lib/diaryStore';
 import { relayManager } from '../../src/lib/relayManager';
 import { diaryManager, fetchEventsByIds } from '../../src/lib/diaryManager';
 import { PostMediaRenderer } from '../../src/components/PostMediaRenderer';
 import { shortPubkey } from '../../src/features/home/profileHelpers';
 import { extractMediaFromContent, parseMediaFromEventTags } from '../../src/lib/mediaExtraction';
 import { normalizePlantDTagSlug } from '../../src/lib/plants/catalog';
+import { PlantPicker } from '../../src/components/PlantPicker';
+import type { PlantSelection } from '../../src/lib/plants/types';
+import { toErrorMessage } from '../../src/lib/errorUtils';
 
 type DiaryEntryView = {
   eventId: string;
@@ -118,6 +122,14 @@ export default function DiaryDetailPage() {
   const [editMode, setEditMode] = useState(false);
   const [entryDrafts, setEntryDrafts] = useState<Record<string, { phase: string; week: string }>>({});
   const [coverImageDraft, setCoverImageDraft] = useState<string | undefined>(undefined);
+  const [titleDraft, setTitleDraft] = useState('');
+  const [plantNameDraft, setPlantNameDraft] = useState('');
+  const [plantSlugDraft, setPlantSlugDraft] = useState('');
+  const [speciesDraft, setSpeciesDraft] = useState('');
+  const [cultivarDraft, setCultivarDraft] = useState('');
+  const [breederDraft, setBreederDraft] = useState('');
+  const [wikiPointerDraft, setWikiPointerDraft] = useState('');
+  const [showMorePlantFields, setShowMorePlantFields] = useState(false);
   const [sortMode, setSortMode] = useState<SortMode>('phase-flow');
 
   const loadDiary = useCallback(async () => {
@@ -160,7 +172,7 @@ export default function DiaryDetailPage() {
       }
       setEventsById(mapped);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to open diary');
+      setError(toErrorMessage(e, 'Failed to open diary'));
     } finally {
       setLoading(false);
     }
@@ -197,6 +209,18 @@ export default function DiaryDetailPage() {
   useEffect(() => {
     setCoverImageDraft(diary?.coverImage);
   }, [diary?.coverImage]);
+
+  useEffect(() => {
+    if (!diary) return;
+    setTitleDraft(diary.title || '');
+    setPlantNameDraft(diary.plant || '');
+    setPlantSlugDraft(diary.plantSlug || '');
+    setSpeciesDraft(diary.species || '');
+    setCultivarDraft(diary.cultivar || '');
+    setBreederDraft(diary.breeder || '');
+    setWikiPointerDraft(diary.plantWikiAPointer || '');
+    setShowMorePlantFields(false);
+  }, [diary]);
 
   const orderedEntries = useMemo(() => {
     const next = [...entries];
@@ -237,6 +261,15 @@ export default function DiaryDetailPage() {
   const handleSaveEdits = async () => {
     if (!diary) return;
     try {
+      await diaryStore.updateDiaryDetails(diary.id, {
+        title: titleDraft,
+        plant: plantNameDraft,
+        plantSlug: plantSlugDraft,
+        species: speciesDraft,
+        cultivar: cultivarDraft,
+        breeder: breederDraft,
+        plantWikiAPointer: wikiPointerDraft,
+      } satisfies DiaryDetailsInput);
       const labelsByEventId: Record<string, string> = {};
       for (const entry of entries) {
         const draft = entryDrafts[entry.eventId] || parsePhaseLabel(entry.phaseLabel);
@@ -247,7 +280,41 @@ export default function DiaryDetailPage() {
       setEditMode(false);
       await loadDiary();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to save edits');
+      setError(toErrorMessage(e, 'Failed to save edits'));
+    }
+  };
+
+  const handleDeleteDiary = () => {
+    if (!diary) return;
+    Alert.alert(
+      'Delete diary',
+      `Do you really want to delete "${diary.title}"? This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            diaryStore
+              .deleteDiary(diary.id)
+              .then(() => {
+                router.replace('/' as Href);
+              })
+              .catch((e) => {
+                setError(toErrorMessage(e, 'Failed to delete diary'));
+              });
+          },
+        },
+      ]
+    );
+  };
+
+  const handlePlantSelection = (selection: PlantSelection) => {
+    setPlantNameDraft(selection.displayName);
+    setPlantSlugDraft(selection.slug);
+    setSpeciesDraft(selection.latinName || '');
+    if (selection.isCustom) {
+      setWikiPointerDraft('');
     }
   };
 
@@ -262,7 +329,7 @@ export default function DiaryDetailPage() {
       });
       await loadDiary();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to remove entry from diary');
+      setError(toErrorMessage(e, 'Failed to remove entry from diary'));
     }
   };
 
@@ -284,6 +351,14 @@ export default function DiaryDetailPage() {
                 onPress={() => {
                   setEditMode(false);
                   setCoverImageDraft(diary?.coverImage);
+                  setTitleDraft(diary?.title || '');
+                  setPlantNameDraft(diary?.plant || '');
+                  setPlantSlugDraft(diary?.plantSlug || '');
+                  setSpeciesDraft(diary?.species || '');
+                  setCultivarDraft(diary?.cultivar || '');
+                  setBreederDraft(diary?.breeder || '');
+                  setWikiPointerDraft(diary?.plantWikiAPointer || '');
+                  setShowMorePlantFields(false);
                 }}
               >
                 <Text style={styles.editCancelButtonText}>Cancel</Text>
@@ -294,7 +369,7 @@ export default function DiaryDetailPage() {
             </View>
           )}
         </View>
-        <Text style={styles.headerTitle}>{diary?.title || 'Diary detail'}</Text>
+        <Text style={styles.headerTitle}>{editMode ? titleDraft || diary?.title || 'Diary detail' : diary?.title || 'Diary detail'}</Text>
       </View>
 
       <ScrollView style={styles.scroll} showsVerticalScrollIndicator={false}>
@@ -314,7 +389,20 @@ export default function DiaryDetailPage() {
         {!loading && diary && (
           <View style={styles.content}>
             <View style={styles.metaCard}>
-              <Text style={styles.metaTitle}>{diary.title}</Text>
+              {!editMode ? (
+                <Text style={styles.metaTitle}>{diary.title}</Text>
+              ) : (
+                <View style={styles.metaEditSection}>
+                  <Text style={styles.metaLabel}>Diary name</Text>
+                  <TextInput
+                    style={styles.metaInput}
+                    value={titleDraft}
+                    onChangeText={setTitleDraft}
+                    placeholder="Diary name"
+                    placeholderTextColor="#9ca3af"
+                  />
+                </View>
+              )}
               <Text style={styles.metaText}>
                 {(diary.plant || 'Plant not set')} • {(diary.phase || 'Phase not set')}
               </Text>
@@ -336,6 +424,67 @@ export default function DiaryDetailPage() {
               ) : null}
               <Text style={styles.metaText}>Entries: {diary.items.length}</Text>
               {diary.coverImage ? <Text style={styles.metaText}>Cover: custom image selected</Text> : null}
+              {editMode && (
+                <View style={styles.metaEditSection}>
+                  <Text style={styles.metaLabel}>Plant</Text>
+                  <PlantPicker
+                    valueSlug={plantSlugDraft}
+                    valueName={plantNameDraft}
+                    onChange={handlePlantSelection}
+                  />
+                  <View style={styles.metaRow}>
+                    <TouchableOpacity
+                      style={styles.smallButton}
+                      onPress={() => {
+                        const slug = normalizePlantDTagSlug(plantSlugDraft || plantNameDraft || '');
+                        if (!slug) return;
+                        router.push(`/plant/${encodeURIComponent(slug)}?name=${encodeURIComponent(plantNameDraft || '')}` as Href);
+                      }}
+                    >
+                      <Text style={styles.smallButtonText}>Plant details</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.editCancelButton}
+                      onPress={() => setShowMorePlantFields((value) => !value)}
+                    >
+                      <Text style={styles.editCancelButtonText}>{showMorePlantFields ? 'Less' : 'More'}</Text>
+                    </TouchableOpacity>
+                  </View>
+                  {showMorePlantFields && (
+                    <View style={styles.moreFieldsWrap}>
+                      <Text style={styles.metaLabel}>Cultivar / Strain</Text>
+                      <TextInput
+                        style={styles.metaInput}
+                        value={cultivarDraft}
+                        onChangeText={setCultivarDraft}
+                        placeholder="Optional cultivar/strain"
+                        placeholderTextColor="#9ca3af"
+                      />
+                      <Text style={styles.metaLabel}>Breeder</Text>
+                      <TextInput
+                        style={styles.metaInput}
+                        value={breederDraft}
+                        onChangeText={setBreederDraft}
+                        placeholder="Optional breeder"
+                        placeholderTextColor="#9ca3af"
+                      />
+                      <Text style={styles.metaLabel}>Wiki article pointer (a)</Text>
+                      <TextInput
+                        style={styles.metaInput}
+                        value={wikiPointerDraft}
+                        onChangeText={setWikiPointerDraft}
+                        placeholder="30818:<pubkey>:<d-tag>"
+                        placeholderTextColor="#9ca3af"
+                      />
+                    </View>
+                  )}
+                </View>
+              )}
+              {editMode && (
+                <TouchableOpacity style={styles.deleteDiaryButton} onPress={handleDeleteDiary}>
+                  <Text style={styles.deleteDiaryButtonText}>Delete diary</Text>
+                </TouchableOpacity>
+              )}
               {editMode && (
                 <View style={styles.coverEditorCard}>
                   <Text style={styles.coverEditorTitle}>Cover image</Text>
@@ -669,6 +818,39 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#1b4d2f',
   },
+  metaEditSection: {
+    marginTop: 8,
+    gap: 6,
+  },
+  metaLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#4b5563',
+  },
+  metaInput: {
+    borderWidth: 1,
+    borderColor: '#d7ccb4',
+    backgroundColor: '#fffdf8',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 13,
+    color: '#1f2937',
+  },
+  metaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  moreFieldsWrap: {
+    borderWidth: 1,
+    borderColor: '#e2d7c2',
+    borderRadius: 8,
+    backgroundColor: '#f8f5ed',
+    padding: 8,
+    gap: 6,
+  },
   metaText: {
     marginTop: 5,
     fontSize: 13,
@@ -688,6 +870,21 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
     color: '#166534',
+  },
+  deleteDiaryButton: {
+    alignSelf: 'flex-start',
+    marginTop: 10,
+    borderWidth: 1,
+    borderColor: '#d58f86',
+    borderRadius: 8,
+    backgroundColor: '#fff4f2',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  deleteDiaryButtonText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#9f2d20',
   },
   sortRow: {
     marginTop: 10,

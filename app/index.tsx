@@ -38,7 +38,7 @@ import {
   fetchAuthorNotes,
   type DiaryIndex,
 } from '../src/lib/diaryManager';
-import { diaryStore, type Diary } from '../src/lib/diaryStore';
+import { diaryStore, type Diary, type DiaryDetailsInput } from '../src/lib/diaryStore';
 import { growmiesStore } from '../src/lib/growmiesStore';
 import { DEFAULT_HASHTAGS } from '../src/features/home/constants';
 import {
@@ -54,6 +54,14 @@ import { getJson, setJson } from '../src/lib/persistentStorage';
 import { extractMediaFromContent } from '../src/lib/mediaExtraction';
 import { normalizePlantDTagSlug } from '../src/lib/plants/catalog';
 import type { PlantSelection } from '../src/lib/plants/types';
+import { FeedPage } from '../src/features/home/components/FeedPage';
+import { RunMenu } from '../src/features/home/components/RunMenu';
+import {
+  buildFeedSearchSuggestions,
+  eventMatchesFeedQuery,
+  splitFeedQueryTerms,
+} from '../src/features/home/feedSearch';
+import { toErrorMessage } from '../src/lib/errorUtils';
 
 const runtimeMode = getRuntimeMode();
 const features = getFeatures(runtimeMode);
@@ -64,32 +72,6 @@ type SettingsSection = 'authentication' | 'relays' | 'hashtags' | 'growmies';
 const LOGIN_PROMPT_DISMISSED_KEY = 'login_prompt_dismissed_v1';
 const ANONYMOUS_BROWSING_ENABLED_KEY = 'anonymous_browsing_enabled_v1';
 const PHASE_TEMPLATE_OPTIONS = ['Seedling', 'Vegetation', 'Flowering', 'Harvest'];
-const FEED_SEARCH_STOPWORDS = new Set([
-  'the',
-  'and',
-  'for',
-  'with',
-  'this',
-  'that',
-  'from',
-  'have',
-  'just',
-  'your',
-  'about',
-  'weed',
-  'plant',
-]);
-
-function tokenizeSearchText(input: string, limit: number = 28): string[] {
-  const normalized = input
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase();
-  const tokens = normalized.match(/[a-z0-9_#]{2,}/g) || [];
-  return tokens
-    .filter((token) => token.length > 2 && !FEED_SEARCH_STOPWORDS.has(token))
-    .slice(0, limit);
-}
 
 function getDiaryCoverForCard(diary: Diary): string | undefined {
   if (diary.coverImage) return diary.coverImage;
@@ -247,6 +229,10 @@ export default function HomeScreen() {
     setNip46BridgePresent(authManager.isNip46BridgePresent());
   }, []);
 
+  const setErrorFromUnknown = useCallback((err: unknown, fallback: string) => {
+    setError(toErrorMessage(err, fallback));
+  }, []);
+
   const persistLoginPromptDismissed = useCallback(async () => {
     setLoginPromptDismissed(true);
     await setJson(LOGIN_PROMPT_DISMISSED_KEY, true);
@@ -398,11 +384,11 @@ export default function HomeScreen() {
         await hydrateDiaryStateFromStore(forcedDiaryId);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load diary');
+      setErrorFromUnknown(err, 'Failed to load diary');
     } finally {
       setDiaryLoading(false);
     }
-  }, [authState.pubkey, relayUrls, hydrateDiaryStateFromStore]);
+  }, [authState.pubkey, relayUrls, hydrateDiaryStateFromStore, setErrorFromUnknown]);
 
   const loadAuthorPosts = useCallback(async (relayOverride?: string[]) => {
     if (!authState.pubkey) return;
@@ -422,11 +408,16 @@ export default function HomeScreen() {
 
       setProfilePosts(notes);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load profile posts');
+      setErrorFromUnknown(err, 'Failed to load profile posts');
     } finally {
       setProfileLoading(false);
     }
-  }, [authState.pubkey, relayUrls]);
+  }, [authState.pubkey, relayUrls, setErrorFromUnknown]);
+
+  const bootstrapLoggedInSession = useCallback(async (pubkey: string) => {
+    const syncedRelays = await syncRelaysAndProfile(pubkey);
+    await Promise.all([subscribeFeed(syncedRelays), loadAuthorPosts(syncedRelays)]);
+  }, [loadAuthorPosts, subscribeFeed, syncRelaysAndProfile]);
 
   useEffect(() => {
     if (!authState.isLoggedIn || !authState.pubkey) {
@@ -450,12 +441,12 @@ export default function HomeScreen() {
     if (lastSyncedPubkey !== authState.pubkey) {
       setLastSyncedPubkey(authState.pubkey);
       syncRelaysAndProfile(authState.pubkey).catch((err) => {
-        setError(err instanceof Error ? err.message : 'Failed to sync user relays/profile');
+        setErrorFromUnknown(err, 'Failed to sync user relays/profile');
       });
     }
 
     loadDiary().catch((err) => {
-      setError(err instanceof Error ? err.message : 'Failed to load diary');
+      setErrorFromUnknown(err, 'Failed to load diary');
     });
     growmiesStore
       .setUser(authState.pubkey)
@@ -466,10 +457,10 @@ export default function HomeScreen() {
         hydrateGrowmiesState();
       })
       .catch((err) => {
-        setError(err instanceof Error ? err.message : 'Failed to load Growmies');
+        setErrorFromUnknown(err, 'Failed to load Growmies');
       });
     loadAuthorPosts().catch((err) => {
-      setError(err instanceof Error ? err.message : 'Failed to load profile posts');
+      setErrorFromUnknown(err, 'Failed to load profile posts');
     });
   }, [
     authState.isLoggedIn,
@@ -480,6 +471,7 @@ export default function HomeScreen() {
     loadDiary,
     hydrateGrowmiesState,
     loadAuthorPosts,
+    setErrorFromUnknown,
   ]);
 
   const openAddToDiaryModal = (event: NostrRawEvent) => {
@@ -553,16 +545,7 @@ export default function HomeScreen() {
       if (!diaryPlantInput.trim()) {
         throw new Error('Plant is required. Select from Plant search or use Custom.');
       }
-      await diaryStore.updateDiaryDetails(diaryDraft.diaryId, {
-        title: diaryTitleInput,
-        plant: diaryPlantInput,
-        plantSlug: diaryPlantSlug,
-        species: diarySpeciesInput,
-        cultivar: diaryCultivarInput,
-        breeder: diaryBreederInput,
-        plantWikiAPointer: diaryPlantWikiAPointer,
-        phase: diaryPhaseInput,
-      });
+      await diaryStore.updateDiaryDetails(diaryDraft.diaryId, collectDiaryDetailsInput());
       await diaryStore.setDiaryItemOrder(
         diaryDraft.diaryId,
         diaryDraft.entries.map((entry) => entry.id)
@@ -578,7 +561,7 @@ export default function HomeScreen() {
       setDiaryEditMode(false);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to publish diary changes');
+      setErrorFromUnknown(err, 'Failed to publish diary changes');
     } finally {
       setDiaryPublishing(false);
     }
@@ -602,13 +585,8 @@ export default function HomeScreen() {
       throw new Error('Plant is required. Select from Plant search or use Custom.');
     }
     const created = await diaryStore.createDiary(proposedTitle, false, {
-      plant: diaryPlantInput,
-      plantSlug: diaryPlantSlug,
-      species: diarySpeciesInput,
-      cultivar: diaryCultivarInput,
-      breeder: diaryBreederInput,
-      plantWikiAPointer: diaryPlantWikiAPointer,
-      phase: diaryPhaseInput,
+      ...collectDiaryDetailsInput(),
+      title: undefined,
     });
     await hydrateDiaryStateFromStore(created.id);
     setDiaryEditMode(false);
@@ -631,7 +609,7 @@ export default function HomeScreen() {
   const handleSelectRun = (run: DiaryRunOption) => {
     setRunMenuOpen(false);
     loadDiary(run.diaryId).catch((err) => {
-      setError(err instanceof Error ? err.message : 'Failed to load selected run');
+      setErrorFromUnknown(err, 'Failed to load selected run');
     });
   };
 
@@ -655,9 +633,9 @@ export default function HomeScreen() {
       await hydrateDiaryStateFromStore(run.diaryId);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to rename diary');
+      setErrorFromUnknown(err, 'Failed to rename diary');
     }
-  }, [hydrateDiaryStateFromStore]);
+  }, [hydrateDiaryStateFromStore, setErrorFromUnknown]);
 
   const handleDeleteRun = useCallback((run: DiaryRunOption) => {
     Alert.alert(
@@ -673,13 +651,13 @@ export default function HomeScreen() {
               .deleteDiary(run.diaryId)
               .then(() => hydrateDiaryStateFromStore())
               .catch((err) => {
-                setError(err instanceof Error ? err.message : 'Failed to delete diary');
+                setErrorFromUnknown(err, 'Failed to delete diary');
               });
           },
         },
       ]
     );
-  }, [hydrateDiaryStateFromStore]);
+  }, [hydrateDiaryStateFromStore, setErrorFromUnknown]);
 
   const handleLogin = async () => {
     try {
@@ -702,11 +680,10 @@ export default function HomeScreen() {
       refreshSignerAvailability();
       await refreshNip46PairingState();
       if (newState.pubkey) {
-        const syncedRelays = await syncRelaysAndProfile(newState.pubkey);
-        await Promise.all([subscribeFeed(syncedRelays), loadAuthorPosts(syncedRelays)]);
+        await bootstrapLoggedInSession(newState.pubkey);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Login failed');
+      setErrorFromUnknown(err, 'Login failed');
     }
   };
 
@@ -720,11 +697,10 @@ export default function HomeScreen() {
       refreshSignerAvailability();
       await refreshNip46PairingState();
       if (newState.pubkey) {
-        const syncedRelays = await syncRelaysAndProfile(newState.pubkey);
-        await Promise.all([subscribeFeed(syncedRelays), loadAuthorPosts(syncedRelays)]);
+        await bootstrapLoggedInSession(newState.pubkey);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to connect signer');
+      setErrorFromUnknown(err, 'Failed to connect signer');
     }
   };
 
@@ -738,11 +714,10 @@ export default function HomeScreen() {
       refreshSignerAvailability();
       await refreshNip46PairingState();
       if (newState.pubkey) {
-        const syncedRelays = await syncRelaysAndProfile(newState.pubkey);
-        await Promise.all([subscribeFeed(syncedRelays), loadAuthorPosts(syncedRelays)]);
+        await bootstrapLoggedInSession(newState.pubkey);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to connect NIP-46');
+      setErrorFromUnknown(err, 'Failed to connect NIP-46');
     }
   };
 
@@ -906,24 +881,16 @@ export default function HomeScreen() {
     refreshFeed();
   };
 
-  const persistDiaryDetails = useCallback(async () => {
-    if (!diaryDraft) return;
-    try {
-      await diaryStore.updateDiaryDetails(diaryDraft.diaryId, {
-        title: diaryTitleInput,
-        plant: diaryPlantInput,
-        plantSlug: diaryPlantSlug,
-        species: diarySpeciesInput,
-        cultivar: diaryCultivarInput,
-        breeder: diaryBreederInput,
-        plantWikiAPointer: diaryPlantWikiAPointer,
-        phase: diaryPhaseInput,
-      });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save diary details');
-    }
-  }, [
-    diaryDraft,
+  const collectDiaryDetailsInput = useCallback((): DiaryDetailsInput => ({
+    title: diaryTitleInput,
+    plant: diaryPlantInput,
+    plantSlug: diaryPlantSlug,
+    species: diarySpeciesInput,
+    cultivar: diaryCultivarInput,
+    breeder: diaryBreederInput,
+    plantWikiAPointer: diaryPlantWikiAPointer,
+    phase: diaryPhaseInput,
+  }), [
     diaryTitleInput,
     diaryPlantInput,
     diaryPlantSlug,
@@ -932,6 +899,19 @@ export default function HomeScreen() {
     diaryBreederInput,
     diaryPlantWikiAPointer,
     diaryPhaseInput,
+  ]);
+
+  const persistDiaryDetails = useCallback(async () => {
+    if (!diaryDraft) return;
+    try {
+      await diaryStore.updateDiaryDetails(diaryDraft.diaryId, collectDiaryDetailsInput());
+    } catch (err) {
+      setErrorFromUnknown(err, 'Failed to save diary details');
+    }
+  }, [
+    diaryDraft,
+    collectDiaryDetailsInput,
+    setErrorFromUnknown,
   ]);
 
   const feedHashtagsKey = useMemo(() => hashtags.join('|'), [hashtags]);
@@ -981,64 +961,19 @@ export default function HomeScreen() {
       filteredEvents = filteredEvents.filter((event) => allowed.has(event.author));
     }
 
-    const query = feedSearchQuery.trim().toLowerCase();
-    if (!query) {
-      return filteredEvents;
-    }
-
-    const queryTerms = query.split(/\s+/).filter(Boolean);
+    const queryTerms = splitFeedQueryTerms(feedSearchQuery);
     if (queryTerms.length === 0) {
       return filteredEvents;
     }
 
     return filteredEvents.filter((event) => {
       const authorLabel = feedAuthorNames[event.author] || '';
-      const keywordSpace = [
-        event.content || '',
-        event.author || '',
-        authorLabel,
-        event.hashtags.map((tag) => `#${tag}`).join(' '),
-      ]
-        .join(' ')
-        .toLowerCase();
-
-      return queryTerms.every((term) => keywordSpace.includes(term));
+      return eventMatchesFeedQuery(event, queryTerms, authorLabel);
     });
   }, [events, onlyGrowmies, growmies, feedSearchQuery, feedAuthorNames]);
 
   const feedSearchSuggestions = useMemo(() => {
-    const query = feedSearchInput.trim().toLowerCase();
-    if (!query) return [] as string[];
-
-    const scores = new Map<string, number>();
-    const addScore = (keyword: string, value: number) => {
-      if (!keyword) return;
-      scores.set(keyword, (scores.get(keyword) || 0) + value);
-    };
-
-    for (const event of events.slice(0, 260)) {
-      for (const tag of event.hashtags.slice(0, 8)) {
-        addScore(`#${tag.toLowerCase()}`, 6);
-        addScore(tag.toLowerCase(), 4);
-      }
-      for (const token of tokenizeSearchText(event.content || '', 20)) {
-        addScore(token, 1);
-      }
-      const authorName = feedAuthorNames[event.author] || '';
-      for (const token of tokenizeSearchText(authorName, 8)) {
-        addScore(token, 3);
-      }
-    }
-
-    return Array.from(scores.entries())
-      .map(([keyword, score]) => ({ keyword, score }))
-      .filter((item) => item.keyword.includes(query))
-      .sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
-        return a.keyword.localeCompare(b.keyword);
-      })
-      .slice(0, 8)
-      .map((item) => item.keyword);
+    return buildFeedSearchSuggestions(events, feedAuthorNames, feedSearchInput, 8);
   }, [events, feedAuthorNames, feedSearchInput]);
 
   const getDiaryTileResizeMode = useCallback((diaryId: string): 'cover' | 'contain' => {
@@ -1161,117 +1096,32 @@ export default function HomeScreen() {
   }, [visibleFeedEvents, relayUrls, feedAuthorNames]);
 
   const renderFeedPage = () => (
-    <View style={styles.pageContainer}>
-      <ScrollView style={styles.scrollContent} showsVerticalScrollIndicator={false}>
-        <View style={[styles.pageInner, isMobile && styles.pageInnerMobile]}>
-          <View style={styles.panel}>
-            <View style={styles.feedHeader}>
-              <Text style={styles.panelTitle}>Decentralized Farmers</Text>
-              <TouchableOpacity style={styles.smallButton} onPress={handleRefresh}>
-                <Text style={styles.buttonText}>Refresh</Text>
-              </TouchableOpacity>
-            </View>
-
-            <View style={styles.feedFilterCard}>
-              <View style={styles.feedSearchRow}>
-                <Text style={styles.feedFilterTitle}>Search</Text>
-                <TextInput
-                  style={[styles.input, styles.flexInput]}
-                  placeholder="Search posts, hashtags, author..."
-                  placeholderTextColor="#999"
-                  value={feedSearchInput}
-                  onChangeText={setFeedSearchInput}
-                  autoCorrect={false}
-                  autoCapitalize="none"
-                />
-                {feedSearchSuggestions.length > 0 && (
-                  <View style={styles.searchSuggestionRow}>
-                    {feedSearchSuggestions.map((keyword) => (
-                      <TouchableOpacity
-                        key={keyword}
-                        style={styles.searchSuggestionChip}
-                        onPress={() => {
-                          setFeedSearchInput(keyword);
-                          setFeedSearchQuery(keyword);
-                        }}
-                      >
-                        <Text style={styles.searchSuggestionText}>{keyword}</Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
-                )}
-              </View>
-              <View style={styles.feedFilterHeader}>
-                <Text style={styles.feedFilterTitle}>Hashtag filter</Text>
-                <TouchableOpacity
-                  style={[styles.filterToggleBtn, !feedFilterEnabled && styles.filterToggleBtnMuted]}
-                  onPress={() => setFeedFilterEnabled((prev) => !prev)}
-                >
-                  <Text style={styles.filterToggleBtnText}>
-                    {feedFilterEnabled ? 'Filtering ON' : 'Filtering OFF'}
-                  </Text>
-                </TouchableOpacity>
-              </View>
-              {feedFilterEnabled ? (
-                <>
-                  <Text style={styles.signerHint}>
-                    Default load uses #weedstr + #plantstr and includes older notes.
-                  </Text>
-                  <View style={styles.hashtagContainer}>
-                    {hashtags.map((tag) => (
-                      <View key={tag} style={styles.hashtagBadge}>
-                        <Text style={styles.hashtagText}>#{tag}</Text>
-                        <TouchableOpacity onPress={() => handleRemoveHashtag(tag)}>
-                          <Text style={styles.removeBtn}>✕</Text>
-                        </TouchableOpacity>
-                      </View>
-                    ))}
-                  </View>
-                  <View style={styles.inputGroup}>
-                    <TextInput
-                      style={[styles.input, styles.flexInput]}
-                      placeholder="Add hashtag"
-                      placeholderTextColor="#999"
-                      value={newHashtag}
-                      onChangeText={setNewHashtag}
-                    />
-                    <TouchableOpacity style={styles.smallButton} onPress={handleAddHashtag}>
-                      <Text style={styles.buttonText}>Add</Text>
-                    </TouchableOpacity>
-                  </View>
-                  <TouchableOpacity style={styles.buttonSecondary} onPress={handleResetDefaultHashtags}>
-                    <Text style={styles.buttonText}>Reset to #weedstr + #plantstr</Text>
-                  </TouchableOpacity>
-                </>
-              ) : (
-                <Text style={styles.signerHint}>Feed runs without hashtag filtering.</Text>
-              )}
-            </View>
-          </View>
-
-          {isLoading && (
-            <View style={styles.centerContent}>
-              <ActivityIndicator size="large" color="#059669" />
-              <Text style={styles.loadingText}>Loading feed...</Text>
-            </View>
-          )}
-
-          {!isLoading && visibleFeedEvents.length === 0 && relayUrls.length > 0 && (
-            <View style={styles.centerContent}>
-              <Text style={styles.emptyText}>
-                {feedSearchQuery
-                  ? 'No matching posts for this search.'
-                  : onlyGrowmies
-                    ? 'No posts from Growmies yet.'
-                    : 'No posts yet.'}
-              </Text>
-            </View>
-          )}
-
-          {visibleFeedEvents.map((event) => renderFeedEventCard(event, true))}
-        </View>
-      </ScrollView>
-    </View>
+    <FeedPage
+      isMobile={isMobile}
+      styles={styles}
+      onRefresh={handleRefresh}
+      feedSearchInput={feedSearchInput}
+      onFeedSearchInputChange={setFeedSearchInput}
+      feedSearchSuggestions={feedSearchSuggestions}
+      onSelectFeedSuggestion={(value) => {
+        setFeedSearchInput(value);
+        setFeedSearchQuery(value);
+      }}
+      feedFilterEnabled={feedFilterEnabled}
+      onToggleFeedFilter={() => setFeedFilterEnabled((prev) => !prev)}
+      hashtags={hashtags}
+      onRemoveHashtag={handleRemoveHashtag}
+      newHashtag={newHashtag}
+      onNewHashtagChange={setNewHashtag}
+      onAddHashtag={handleAddHashtag}
+      onResetDefaultHashtags={handleResetDefaultHashtags}
+      isLoading={isLoading}
+      visibleFeedEvents={visibleFeedEvents}
+      relayUrlsCount={relayUrls.length}
+      onlyGrowmies={onlyGrowmies}
+      feedSearchQuery={feedSearchQuery}
+      renderFeedEventCard={renderFeedEventCard}
+    />
   );
 
   const renderProfilePage = () => (
@@ -1539,37 +1389,17 @@ export default function HomeScreen() {
                   <Text style={styles.syncBadgeText}>Sync: {selectedRunSyncStatus}</Text>
                 </View>
                 {runMenuOpen && runOptions.length > 0 && (
-                  <View style={styles.runMenu}>
-                    {runOptions.map((run) => (
-                      <View key={run.diaryId} style={styles.runMenuItem}>
-                        <TouchableOpacity style={styles.runMenuSelectBtn} onPress={() => handleSelectRun(run)}>
-                          <Text style={styles.runMenuText}>
-                            {run.title} • {run.syncStatus} • {run.itemCount} items
-                          </Text>
-                        </TouchableOpacity>
-                        <View style={styles.runMenuActions}>
-                          <TouchableOpacity
-                            style={styles.runActionButton}
-                            onPress={() => {
-                              handleRenameRun(run).catch(() => {
-                                // error handled in callback
-                              });
-                            }}
-                          >
-                            <Text style={styles.runActionButtonText}>Rename</Text>
-                          </TouchableOpacity>
-                          <TouchableOpacity
-                            style={[styles.runActionButton, styles.runActionButtonDanger]}
-                            onPress={() => handleDeleteRun(run)}
-                          >
-                            <Text style={[styles.runActionButtonText, styles.runActionButtonDangerText]}>
-                              Delete
-                            </Text>
-                          </TouchableOpacity>
-                        </View>
-                      </View>
-                    ))}
-                  </View>
+                  <RunMenu
+                    styles={styles}
+                    runs={runOptions}
+                    onSelectRun={handleSelectRun}
+                    onRenameRun={(run) => {
+                      handleRenameRun(run).catch(() => {
+                        // error handled in callback
+                      });
+                    }}
+                    onDeleteRun={handleDeleteRun}
+                  />
                 )}
               </>
             )}
