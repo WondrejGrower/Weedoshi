@@ -1,7 +1,11 @@
-const NSEC_REGEX = /\bnsec1[023456789acdefghjklmnpqrstuvwxyz]{20,}\b/gi;
-const HEX_PRIVKEY_REGEX = /\b[a-f0-9]{64}\b/gi;
-const NCRYPTSEC_REGEX = /\bncryptsec1[023456789acdefghjklmnpqrstuvwxyz]{20,}\b/gi;
+const NSEC_REGEX = /\bnsec1[023456789acdefghjklmnpqrstuvwxyz]{20,}\b/i;
+const HEX_PRIVKEY_REGEX = /\b[a-f0-9]{64}\b/i;
+const NCRYPTSEC_REGEX = /\bncryptsec1[023456789acdefghjklmnpqrstuvwxyz]{20,}\b/i;
 const SEED_HINT_REGEX = /\b(seed phrase|mnemonic|recovery phrase|backup phrase)\b/i;
+
+const REDACT_NSEC_REGEX = /\bnsec1[023456789acdefghjklmnpqrstuvwxyz]{20,}\b/gi;
+const REDACT_HEX_PRIVKEY_REGEX = /\b[a-f0-9]{64}\b/gi;
+const REDACT_NCRYPTSEC_REGEX = /\bncryptsec1[023456789acdefghjklmnpqrstuvwxyz]{20,}\b/gi;
 
 type SensitiveCheck = {
   hasSensitive: boolean;
@@ -10,9 +14,9 @@ type SensitiveCheck = {
 
 function redactString(input: string): string {
   return input
-    .replace(NSEC_REGEX, '[REDACTED_NSEC]')
-    .replace(NCRYPTSEC_REGEX, '[REDACTED_NCRYPTSEC]')
-    .replace(HEX_PRIVKEY_REGEX, '[REDACTED_HEX_SECRET]');
+    .replace(REDACT_NSEC_REGEX, '[REDACTED_NSEC]')
+    .replace(REDACT_NCRYPTSEC_REGEX, '[REDACTED_NCRYPTSEC]')
+    .replace(REDACT_HEX_PRIVKEY_REGEX, '[REDACTED_HEX_SECRET]');
 }
 
 function looksLikeSeedPhrase(input: string): boolean {

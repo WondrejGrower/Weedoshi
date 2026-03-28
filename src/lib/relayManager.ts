@@ -52,12 +52,13 @@ class RelayManager {
   }
 
   addRelay(url: string): boolean {
+    const normalizedUrl = url.trim();
     const isValidUrl =
       typeof URL.canParse === 'function'
-        ? URL.canParse(url)
+        ? URL.canParse(normalizedUrl)
         : (() => {
             try {
-              const parsed = new URL(url);
+              const parsed = new URL(normalizedUrl);
               return Boolean(parsed);
             } catch {
               return false;
@@ -68,11 +69,16 @@ class RelayManager {
       throw new Error('Invalid relay URL');
     }
 
-    if (this.relays.some(r => r.url === url)) {
+    const parsed = new URL(normalizedUrl);
+    if (parsed.protocol !== 'wss:') {
+      throw new Error('Relay URL must use wss://');
+    }
+
+    if (this.relays.some(r => r.url === normalizedUrl)) {
       return false;
     }
 
-    this.relays.push({ url, enabled: true, custom: true });
+    this.relays.push({ url: normalizedUrl, enabled: true, custom: true });
     this.saveToStorage();
     return true;
   }

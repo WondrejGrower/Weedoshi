@@ -6,6 +6,8 @@ import { eventDeduplicator } from './eventDeduplicator';
 import { eventValidator } from './eventValidator';
 import { relayHealthMonitor } from './relayHealthMonitor';
 import { eventCache } from './eventCache';
+import { perfMonitor } from './perfMonitor';
+import { parseNip20Prefix } from './networkResult';
 
 export interface NostrEvent extends Event {
   relayUrl?: string;
@@ -61,6 +63,15 @@ export class NostrClient {
 
   getRelays(): string[] {
     return this.relayUrls;
+  }
+
+  private async querySyncTimed(relays: string[], filter: Filter, opts: { maxWait: number; label: string }) {
+    const startedAt = Date.now();
+    try {
+      return await this.pool.querySync(relays, filter as any, opts);
+    } finally {
+      perfMonitor.recordQueryDuration(Date.now() - startedAt);
+    }
   }
 
   async subscribeFeed(
@@ -130,7 +141,6 @@ export class NostrClient {
     let eventReceived = false;
     let timeoutFired = false;
     let eventCount = 0;
-    let duplicateCount = 0;
 
     // Timeout pro connection (5 sekund)
     const timeoutId = setTimeout(() => {
@@ -151,8 +161,10 @@ export class NostrClient {
     const filters = [filter] as any;
 
     try {
+      perfMonitor.recordSubscribeCall();
       const sub = this.pool.subscribeMany(this.relayUrls, filters, {
-        onevent(event: Event, relay?: string) {
+        onevent: (event: Event, relay?: string) => {
+          perfMonitor.recordNetworkEventReceived();
           // Record success for the relay
           if (relay) {
             relayHealthMonitor.recordSuccess(relay);
@@ -165,7 +177,6 @@ export class NostrClient {
 
           // 2. Check for duplicates
           if (eventDeduplicator.isDuplicate(event.id)) {
-            duplicateCount++;
             return; // Skip duplicate events
           }
 
@@ -181,23 +192,29 @@ export class NostrClient {
           const nostrEvent: NostrEvent = { ...event, relayUrl: relay };
           onEvent(nostrEvent);
         },
-        oneose() {
+        oneose: (relay?: string) => {
           // End of stored events - connection established
-          const dedupStats = eventDeduplicator.getStats();
-          const validatorStats = eventValidator.getStats();
-          const healthStats = relayHealthMonitor.getStats();
-          const cacheStats = eventCache.getStats();
-          diagnostics.log(
-            `End of stored events - ${eventCount} unique, ${duplicateCount} duplicates filtered`,
-            'info'
-          );
-          logger.info(`✅ Nostr: ${eventCount} unique events (${duplicateCount} duplicates filtered)`);
-          logger.info(`📊 Deduplication:`, dedupStats);
-          logger.info(`🔒 Validation:`, validatorStats);
-          logger.info(`💚 Relay Health:`, healthStats);
-          logger.info(`📦 Cache:`, cacheStats);
+          if (relay) {
+            diagnostics.log(`EOSE from ${relay}`, 'info');
+          }
           eventReceived = true;
         },
+        onclose: (reasons: string[]) => {
+          reasons.forEach((reason, idx) => {
+            const relay = this.relayUrls[idx];
+            if (relay && reason) {
+              const prefix = parseNip20Prefix(reason);
+              const prefixLabel = prefix ? ` [${prefix}]` : '';
+              diagnostics.log(`Subscription closed by ${relay}${prefixLabel}: ${reason}`, 'warn');
+              
+              if (prefix === 'auth-required') {
+                relayHealthMonitor.recordFailure(relay, 'Authentication required');
+              } else if (prefix === 'rate-limited') {
+                relayHealthMonitor.recordFailure(relay, 'Rate limited');
+              }
+            }
+          });
+        }
       });
 
       this.subscriptions.set(subId, () => {
@@ -232,7 +249,7 @@ export class NostrClient {
     };
 
     try {
-      const events = await this.pool.querySync(this.relayUrls, filter as any, {
+      const events = await this.querySyncTimed(this.relayUrls, filter, {
         maxWait: maxWaitMs,
         label: 'fallback-public-notes',
       });
@@ -276,7 +293,7 @@ export class NostrClient {
     };
 
     try {
-      const events = await this.pool.querySync(this.relayUrls, filter as any, {
+      const events = await this.querySyncTimed(this.relayUrls, filter, {
         maxWait: maxWaitMs,
         label: 'hashtag-backfill',
       });
@@ -314,7 +331,7 @@ export class NostrClient {
     (filter as any).search = normalizedQuery;
 
     try {
-      const events = await this.pool.querySync(this.relayUrls, filter as any, {
+      const events = await this.querySyncTimed(this.relayUrls, filter, {
         maxWait: maxWaitMs,
         label: 'search-backfill',
       });
@@ -347,7 +364,7 @@ export class NostrClient {
     };
 
     try {
-      const events = await this.pool.querySync(seedRelays, filter as any, {
+      const events = await this.querySyncTimed(seedRelays, filter, {
         maxWait: maxWaitMs,
         label: 'user-relay-preferences',
       });
@@ -372,6 +389,59 @@ export class NostrClient {
     }
   }
 
+  /**
+   * Fetch NIP-65 write relays for a given pubkey.
+   * Useful for the "Outbox model" where we look for an author's notes 
+   * on the relays they explicitly write to.
+   */
+  async fetchUserWriteRelays(
+    pubkey: string,
+    seedRelays: string[],
+    maxWaitMs: number = 6000
+  ): Promise<string[]> {
+    if (!pubkey || seedRelays.length === 0) {
+      return [];
+    }
+
+    const filter: Filter = {
+      kinds: [10002],
+      authors: [pubkey],
+      limit: 5,
+    };
+
+    try {
+      const events = await this.querySyncTimed(seedRelays, filter, {
+        maxWait: maxWaitMs,
+        label: 'user-write-relays',
+      });
+
+      const latest = events.sort((a, b) => b.created_at - a.created_at)[0];
+      if (!latest) {
+        return [];
+      }
+
+      // NIP-65: ["r", "wss://...", "read" | "write"]
+      // If 3rd element is missing, it's both read/write.
+      const writeRelays = latest.tags
+        .filter((tag) => {
+          if (tag[0] !== 'r' || typeof tag[1] !== 'string') return false;
+          const url = tag[1].trim();
+          if (!url.startsWith('wss://')) return false;
+          const type = tag[2];
+          return !type || type.toLowerCase() === 'write';
+        })
+        .map((tag) => tag[1].trim());
+
+      return Array.from(new Set(writeRelays));
+    } catch (error) {
+      diagnostics.log(
+        `Failed to fetch user write relays: ${error instanceof Error ? error.message : String(error)}`,
+        'warn'
+      );
+      return [];
+    }
+  }
+
   async fetchProfileMetadata(
     pubkey: string,
     relays: string[],
@@ -388,7 +458,7 @@ export class NostrClient {
     };
 
     try {
-      const events = await this.pool.querySync(relays, filter as any, {
+      const events = await this.querySyncTimed(relays, filter, {
         maxWait: maxWaitMs,
         label: 'profile-metadata',
       });
@@ -410,6 +480,69 @@ export class NostrClient {
         'warn'
       );
       return null;
+    }
+  }
+
+  /**
+   * Fetch a page of feed events with pagination support.
+   */
+  async fetchFeedPage(
+    hashtags: string[],
+    limit: number = 50,
+    until?: number,
+    searchQuery?: string,
+    maxWaitMs: number = 7000
+  ): Promise<NostrEvent[]> {
+    if (this.relayUrls.length === 0) {
+      return [];
+    }
+
+    const filter: Filter = {
+      kinds: [1],
+      limit,
+    };
+
+    if (until) {
+      filter.until = until;
+    }
+
+    const normalizedHashtags = hashtags
+      .map((tag) => tag.trim().toLowerCase())
+      .filter(Boolean);
+
+    if (normalizedHashtags.length > 0) {
+      filter['#t'] = normalizedHashtags;
+    }
+
+    const normalizedSearchQuery = searchQuery?.trim();
+    if (normalizedSearchQuery) {
+      (filter as any).search = normalizedSearchQuery;
+    }
+
+    try {
+      const events = await this.querySyncTimed(this.relayUrls, filter, {
+        maxWait: maxWaitMs,
+        label: until ? `feed-page-until-${until}` : 'feed-page-latest',
+      });
+
+      // Validace, deduplikace a seřazení (created_at DESC, id tiebreak)
+      const validEvents = events.filter((event) => eventValidator.validateEvent(event));
+      
+      // Sort deterministically: created_at DESC, then id ASC
+      return validEvents
+        .sort((a, b) => {
+          if (b.created_at !== a.created_at) {
+            return b.created_at - a.created_at;
+          }
+          return a.id.localeCompare(b.id);
+        })
+        .map((event) => ({ ...event }));
+    } catch (error) {
+      diagnostics.log(
+        `Feed page fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+        'warn'
+      );
+      return [];
     }
   }
 

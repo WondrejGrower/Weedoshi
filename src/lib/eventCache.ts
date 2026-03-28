@@ -4,8 +4,10 @@ import { diagnostics } from './diagnostics';
 
 const CACHE_KEY_PREFIX = 'nostr_event_cache_';
 const CACHE_METADATA_KEY = 'nostr_cache_metadata';
+const CACHE_INDEX_KEY = 'nostr_cache_index';
 const DEFAULT_TTL = 24 * 60 * 60 * 1000; // 24 hours
 const MAX_CACHE_SIZE = 1000; // Max events in cache
+const FLUSH_DELAY_MS = 120;
 
 interface CachedEvent {
   event: Event;
@@ -29,6 +31,10 @@ export class EventCache {
   private ttl: number;
   private maxSize: number;
   private isInitialized = false;
+  private keyIndex: Set<string> = new Set();
+  private pendingWrites: Map<string, string | null> = new Map();
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private isFlushing = false;
 
   constructor(ttl: number = DEFAULT_TTL, maxSize: number = MAX_CACHE_SIZE) {
     this.ttl = ttl;
@@ -62,25 +68,33 @@ export class EventCache {
       relayUrl,
     };
 
-    // Add to memory cache
     this.memoryCache.set(event.id, cached);
+    this.queueSet(`${CACHE_KEY_PREFIX}${event.id}`, JSON.stringify(cached));
 
-    // Enforce max size
     if (this.memoryCache.size > this.maxSize) {
-      await this.evictOldest();
+      this.evictOldest();
     }
-
-    // Persist to storage (batched)
-    await this.persistEvent(event.id, cached);
   }
 
   /**
    * Save multiple events at once
    */
   async saveEvents(events: Event[], relayUrl?: string): Promise<void> {
+    const now = Date.now();
     for (const event of events) {
-      await this.saveEvent(event, relayUrl);
+      const cached: CachedEvent = {
+        event,
+        cachedAt: now,
+        relayUrl,
+      };
+      this.memoryCache.set(event.id, cached);
+      this.queueSet(`${CACHE_KEY_PREFIX}${event.id}`, JSON.stringify(cached));
     }
+
+    if (this.memoryCache.size > this.maxSize) {
+      this.evictOldest();
+    }
+
     await this.updateMetadata();
     diagnostics.log(`Cached ${events.length} events`, 'info');
   }
@@ -95,35 +109,30 @@ export class EventCache {
     const now = Date.now();
 
     for (const cached of this.memoryCache.values()) {
-      // Check TTL
       if (now - cached.cachedAt > this.ttl) {
         continue;
       }
 
       const event = cached.event;
 
-      // Filter by kind
       if (filter.kinds && !filter.kinds.includes(event.kind)) {
         continue;
       }
 
-      // Filter by authors
       if (filter.authors && !filter.authors.includes(event.pubkey)) {
         continue;
       }
 
-      // Filter by hashtags (#t tag)
       if (filter['#t']) {
         const eventHashtags = event.tags
-          .filter(tag => tag[0] === 't')
-          .map(tag => tag[1]?.toLowerCase());
-        const filterHashtags = (filter['#t'] as string[]).map(t => t.toLowerCase());
-        if (!filterHashtags.some(tag => eventHashtags.includes(tag))) {
+          .filter((tag) => tag[0] === 't')
+          .map((tag) => tag[1]?.toLowerCase());
+        const filterHashtags = (filter['#t'] as string[]).map((t) => t.toLowerCase());
+        if (!filterHashtags.some((tag) => eventHashtags.includes(tag))) {
           continue;
         }
       }
 
-      // Filter by time
       if (filter.since && event.created_at < filter.since) {
         continue;
       }
@@ -134,10 +143,8 @@ export class EventCache {
       results.push(event);
     }
 
-    // Sort by created_at (newest first)
     results.sort((a, b) => b.created_at - a.created_at);
 
-    // Apply limit
     if (filter.limit && results.length > filter.limit) {
       return results.slice(0, filter.limit);
     }
@@ -183,10 +190,20 @@ export class EventCache {
    */
   async clear(): Promise<void> {
     this.memoryCache.clear();
+
+    const keysToRemove = [...this.keyIndex, CACHE_METADATA_KEY, CACHE_INDEX_KEY];
+    this.keyIndex.clear();
+    this.pendingWrites.clear();
+
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+
     try {
-      const keys = await AsyncStorage.getAllKeys();
-      const cacheKeys = keys.filter(key => key.startsWith(CACHE_KEY_PREFIX));
-      await AsyncStorage.multiRemove([...cacheKeys, CACHE_METADATA_KEY]);
+      if (keysToRemove.length > 0) {
+        await AsyncStorage.multiRemove(keysToRemove);
+      }
       diagnostics.log('✅ Event cache cleared', 'info');
     } catch (error) {
       diagnostics.log(`⚠️ Failed to clear cache: ${error}`, 'warn');
@@ -198,18 +215,21 @@ export class EventCache {
    */
   private async cleanupOldEvents(): Promise<void> {
     const now = Date.now();
-    let removedCount = 0;
+    const expiredIds: string[] = [];
 
     for (const [id, cached] of this.memoryCache) {
       if (now - cached.cachedAt > this.ttl) {
-        this.memoryCache.delete(id);
-        await this.removeFromStorage(id);
-        removedCount++;
+        expiredIds.push(id);
       }
     }
 
-    if (removedCount > 0) {
-      diagnostics.log(`Cleaned up ${removedCount} expired events`, 'info');
+    for (const id of expiredIds) {
+      this.memoryCache.delete(id);
+      this.queueRemove(`${CACHE_KEY_PREFIX}${id}`);
+    }
+
+    if (expiredIds.length > 0) {
+      diagnostics.log(`Cleaned up ${expiredIds.length} expired events`, 'info');
       await this.updateMetadata();
     }
   }
@@ -217,41 +237,85 @@ export class EventCache {
   /**
    * Evict oldest events when cache is full
    */
-  private async evictOldest(): Promise<void> {
+  private evictOldest(): void {
     const entries = Array.from(this.memoryCache.entries());
     entries.sort((a, b) => a[1].cachedAt - b[1].cachedAt);
 
-    const toRemove = entries.slice(0, Math.floor(this.maxSize * 0.1)); // Remove 10%
+    const toRemove = entries.slice(0, Math.floor(this.maxSize * 0.1));
     for (const [id] of toRemove) {
       this.memoryCache.delete(id);
-      await this.removeFromStorage(id);
+      this.queueRemove(`${CACHE_KEY_PREFIX}${id}`);
     }
 
     diagnostics.log(`Evicted ${toRemove.length} oldest events`, 'info');
   }
 
-  /**
-   * Persist a single event to storage
-   */
-  private async persistEvent(id: string, cached: CachedEvent): Promise<void> {
-    try {
-      await AsyncStorage.setItem(
-        `${CACHE_KEY_PREFIX}${id}`,
-        JSON.stringify(cached)
-      );
-    } catch (error) {
-      diagnostics.log(`⚠️ Failed to persist event ${id}: ${error}`, 'warn');
+  private queueSet(key: string, value: string): void {
+    if (key.startsWith(CACHE_KEY_PREFIX)) {
+      this.keyIndex.add(key);
     }
+    this.pendingWrites.set(key, value);
+    this.scheduleFlush();
   }
 
-  /**
-   * Remove event from storage
-   */
-  private async removeFromStorage(id: string): Promise<void> {
+  private queueRemove(key: string): void {
+    if (key.startsWith(CACHE_KEY_PREFIX)) {
+      this.keyIndex.delete(key);
+    }
+    this.pendingWrites.set(key, null);
+    this.scheduleFlush();
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushTimer) {
+      return;
+    }
+
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flushPendingWrites().catch((error) => {
+        diagnostics.log(`⚠️ Failed to flush cache writes: ${error}`, 'warn');
+      });
+    }, FLUSH_DELAY_MS);
+  }
+
+  private async flushPendingWrites(): Promise<void> {
+    if (this.isFlushing || this.pendingWrites.size === 0) {
+      return;
+    }
+
+    this.isFlushing = true;
+
     try {
-      await AsyncStorage.removeItem(`${CACHE_KEY_PREFIX}${id}`);
-    } catch (error) {
-      diagnostics.log(`⚠️ Failed to remove event ${id}: ${error}`, 'warn');
+      while (this.pendingWrites.size > 0) {
+        const snapshot = new Map(this.pendingWrites);
+        this.pendingWrites.clear();
+
+        const setOps: [string, string][] = [];
+        const removeOps: string[] = [];
+
+        for (const [key, value] of snapshot.entries()) {
+          if (value === null) {
+            removeOps.push(key);
+          } else {
+            setOps.push([key, value]);
+          }
+        }
+
+        if (setOps.length > 0) {
+          await Promise.all(setOps.map(([key, value]) => AsyncStorage.setItem(key, value)));
+        }
+        if (removeOps.length > 0) {
+          await AsyncStorage.multiRemove(removeOps);
+        }
+      }
+
+      await AsyncStorage.setItem(CACHE_INDEX_KEY, JSON.stringify([...this.keyIndex]));
+    } finally {
+      this.isFlushing = false;
+      if (this.pendingWrites.size > 0) {
+        this.scheduleFlush();
+      }
     }
   }
 
@@ -260,26 +324,49 @@ export class EventCache {
    */
   private async loadFromStorage(): Promise<void> {
     try {
-      const keys = await AsyncStorage.getAllKeys();
-      const cacheKeys = keys.filter(key => key.startsWith(CACHE_KEY_PREFIX));
+      const indexRaw = await AsyncStorage.getItem(CACHE_INDEX_KEY);
+      let cacheKeys: string[] = [];
 
-      if (cacheKeys.length === 0) {
-        return;
-      }
-
-      const items = await AsyncStorage.multiGet(cacheKeys);
-      for (const [key, value] of items) {
-        if (value) {
-          try {
-            const cached: CachedEvent = JSON.parse(value);
-            const eventId = key.replace(CACHE_KEY_PREFIX, '');
-            this.memoryCache.set(eventId, cached);
-          } catch {
-            // Skip invalid entries
+      if (indexRaw) {
+        try {
+          const parsed = JSON.parse(indexRaw) as unknown;
+          if (Array.isArray(parsed)) {
+            cacheKeys = parsed.filter((key): key is string => typeof key === 'string' && key.startsWith(CACHE_KEY_PREFIX));
           }
+        } catch {
+          cacheKeys = [];
         }
       }
 
+      if (cacheKeys.length === 0) {
+        const keys = await AsyncStorage.getAllKeys();
+        cacheKeys = keys.filter((key) => key.startsWith(CACHE_KEY_PREFIX));
+      }
+
+      if (cacheKeys.length === 0) {
+        this.keyIndex.clear();
+        return;
+      }
+
+      this.keyIndex = new Set(cacheKeys);
+      const items = await AsyncStorage.multiGet(cacheKeys);
+
+      for (const [key, value] of items) {
+        if (!value) {
+          this.keyIndex.delete(key);
+          continue;
+        }
+
+        try {
+          const cached: CachedEvent = JSON.parse(value);
+          const eventId = key.replace(CACHE_KEY_PREFIX, '');
+          this.memoryCache.set(eventId, cached);
+        } catch {
+          this.keyIndex.delete(key);
+        }
+      }
+
+      await AsyncStorage.setItem(CACHE_INDEX_KEY, JSON.stringify([...this.keyIndex]));
       diagnostics.log(`Loaded ${this.memoryCache.size} events from storage`, 'info');
     } catch (error) {
       diagnostics.log(`⚠️ Failed to load from storage: ${error}`, 'warn');
@@ -292,9 +379,12 @@ export class EventCache {
   private async updateMetadata(): Promise<void> {
     try {
       const events = Array.from(this.memoryCache.values());
-      if (events.length === 0) return;
+      if (events.length === 0) {
+        this.queueRemove(CACHE_METADATA_KEY);
+        return;
+      }
 
-      const timestamps = events.map(e => e.event.created_at);
+      const timestamps = events.map((e) => e.event.created_at);
       const metadata: CacheMetadata = {
         totalEvents: events.length,
         oldestEventTime: Math.min(...timestamps),
@@ -302,7 +392,7 @@ export class EventCache {
         lastCleanup: Date.now(),
       };
 
-      await AsyncStorage.setItem(CACHE_METADATA_KEY, JSON.stringify(metadata));
+      this.queueSet(CACHE_METADATA_KEY, JSON.stringify(metadata));
     } catch (error) {
       diagnostics.log(`⚠️ Failed to update metadata: ${error}`, 'warn');
     }

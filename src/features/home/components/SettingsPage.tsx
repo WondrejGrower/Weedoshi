@@ -1,12 +1,11 @@
-import { ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { DiagnosticsPanel } from '../../../components/DiagnosticsPanel';
 import { SmartRelayPanel } from '../../../components/SmartRelayPanel';
-
 export function SettingsPage(props: any) {
   const {
-    styles,
     isMobile,
     settingsSection,
+
     authState,
     anonymousBrowsingEnabled,
     signerAvailable,
@@ -51,6 +50,8 @@ export function SettingsPage(props: any) {
     growmies,
     feedAuthorNames,
   } = props;
+
+  const styles = localStyles;
 
   return (
     <ScrollView style={styles.pageContainer} showsVerticalScrollIndicator={false}>
@@ -361,3 +362,232 @@ export function SettingsPage(props: any) {
     </ScrollView>
   );
 }
+
+const localStyles = StyleSheet.create({
+  pageContainer: {
+    flex: 1,
+    paddingTop: 72,
+    paddingBottom: 98,
+  },
+  pageInner: {
+    width: '100%',
+    maxWidth: 1000,
+    alignSelf: 'center',
+    paddingHorizontal: 14,
+    paddingBottom: 40,
+  },
+  pageInnerMobile: {
+    paddingHorizontal: 10,
+  },
+  panel: {
+    backgroundColor: '#fffdf8',
+    borderWidth: 1,
+    borderColor: '#e1d1ae',
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 16,
+  },
+  panelTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#1b4d2f',
+    marginBottom: 12,
+  },
+  statusText: {
+    fontSize: 14,
+    color: '#6b7280',
+    marginBottom: 8,
+  },
+  infoBox: {
+    backgroundColor: '#fffbeb',
+    borderWidth: 1,
+    borderColor: '#fde68a',
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 16,
+  },
+  infoText: {
+    fontSize: 13,
+    color: '#92400e',
+    fontWeight: '600',
+  },
+  button: {
+    borderRadius: 8,
+    backgroundColor: '#059669',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  buttonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  buttonSecondary: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    backgroundColor: '#f9fafb',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  smallButton: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    backgroundColor: '#fff',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+  },
+  signerHint: {
+    fontSize: 12,
+    color: '#6b7280',
+    fontStyle: 'italic',
+    marginBottom: 8,
+  },
+  nip46PairingCard: {
+    backgroundColor: '#f0fdf4',
+    borderWidth: 1,
+    borderColor: '#bbf7d0',
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 16,
+    gap: 10,
+  },
+  nip46PairingTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#166534',
+  },
+  nip46PairingActions: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  nip46PairingMono: {
+    fontSize: 11,
+    fontFamily: 'monospace',
+    color: '#374151',
+    backgroundColor: '#fff',
+    padding: 8,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+  },
+  tabContainer: {
+    flexDirection: 'row',
+    backgroundColor: '#f3f4f6',
+    borderRadius: 8,
+    padding: 4,
+    marginBottom: 16,
+  },
+  tab: {
+    flex: 1,
+    paddingVertical: 8,
+    alignItems: 'center',
+    borderRadius: 6,
+  },
+  activeTab: {
+    backgroundColor: '#fff',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  tabText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#6b7280',
+  },
+  activeTabText: {
+    color: '#1f2937',
+  },
+  input: {
+    borderWidth: 1,
+    borderColor: '#dacdb3',
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 14,
+    backgroundColor: '#fff',
+    marginBottom: 12,
+  },
+  flexInput: {
+    flex: 1,
+  },
+  inputGroup: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center',
+  },
+  relayItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f3f4f6',
+    gap: 12,
+  },
+  checkbox: {
+    width: 22,
+    height: 22,
+    borderRadius: 4,
+    borderWidth: 2,
+    borderColor: '#059669',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkmark: {
+    color: '#059669',
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  relayUrl: {
+    flex: 1,
+    fontSize: 14,
+    color: '#374151',
+  },
+  removeBtn: {
+    fontSize: 16,
+    color: '#ef4444',
+    fontWeight: '700',
+    padding: 4,
+  },
+  hashtagContainer: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 16,
+  },
+  hashtagBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#ecfdf5',
+    borderWidth: 1,
+    borderColor: '#bbf7d0',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  hashtagText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#047857',
+  },
+  readOnlyGuardHint: {
+    fontSize: 11,
+    color: '#ef4444',
+    textAlign: 'center',
+    fontWeight: '600',
+    marginTop: 4,
+  },
+  emptyText: {
+    fontSize: 14,
+    color: '#9ca3af',
+    textAlign: 'center',
+    paddingVertical: 20,
+  },
+});

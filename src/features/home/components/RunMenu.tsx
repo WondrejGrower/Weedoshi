@@ -1,4 +1,4 @@
-import { Text, TouchableOpacity, View } from 'react-native';
+import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 export type RunMenuItem = {
   diaryId: string;
@@ -9,7 +9,6 @@ export type RunMenuItem = {
 };
 
 type RunMenuProps = {
-  styles: any;
   runs: RunMenuItem[];
   onSelectRun: (run: RunMenuItem) => void;
   onRenameRun: (run: RunMenuItem) => void;
@@ -17,13 +16,14 @@ type RunMenuProps = {
 };
 
 export function RunMenu({
-  styles,
   runs,
   onSelectRun,
   onRenameRun,
   onDeleteRun,
 }: RunMenuProps) {
   if (runs.length === 0) return null;
+
+  const styles = localStyles;
 
   return (
     <View style={styles.runMenu}>
@@ -52,3 +52,53 @@ export function RunMenu({
     </View>
   );
 }
+
+const localStyles = StyleSheet.create({
+  runMenu: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#dacdb3',
+    borderRadius: 8,
+    marginTop: 8,
+    overflow: 'hidden',
+  },
+  runMenuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f3f4f6',
+  },
+  runMenuSelectBtn: {
+    flex: 1,
+  },
+  runMenuText: {
+    fontSize: 14,
+    color: '#1f2937',
+    fontWeight: '600',
+  },
+  runMenuActions: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  runActionButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    backgroundColor: '#f9fafb',
+  },
+  runActionButtonText: {
+    fontSize: 12,
+    color: '#4b5563',
+    fontWeight: '700',
+  },
+  runActionButtonDanger: {
+    borderColor: '#fee2e2',
+    backgroundColor: '#fef2f2',
+  },
+  runActionButtonDangerText: {
+    color: '#ef4444',
+  },
+});

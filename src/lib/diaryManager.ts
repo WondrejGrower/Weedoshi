@@ -3,6 +3,7 @@ import { SimplePool, finalizeEvent } from 'nostr-tools';
 import { diagnostics } from './diagnostics';
 import { assertNoSensitiveMaterial } from './securityBaseline';
 import { requireAtLeastOneSuccess } from './networkResult';
+import { eventValidator } from './eventValidator';
 
 export const DIARY_INDEX_KIND = 30078;
 
@@ -183,6 +184,9 @@ async function fetchEvents(
 
     const sub = pool.subscribeMany(relayUrls, filters as any, {
       onevent(event: Event) {
+        if (!eventValidator.validateEvent(event)) {
+          return;
+        }
         collected.set(event.id, event);
       },
       oneose() {
@@ -258,7 +262,16 @@ export async function fetchAuthorNotes(
       label: 'author-notes',
     });
 
-    return events.sort((a, b) => b.created_at - a.created_at);
+    const byId = new Map<string, Event>();
+    for (const event of events) {
+      if (!byId.has(event.id)) {
+        byId.set(event.id, event);
+      }
+    }
+
+    return Array.from(byId.values())
+      .sort((a, b) => b.created_at - a.created_at)
+      .slice(0, limit);
   } catch {
     return [];
   }

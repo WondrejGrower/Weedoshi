@@ -3,16 +3,33 @@ import { SimplePool } from 'nostr-tools';
 import type { AuthState } from './authManager';
 import type { Diary, DiaryItemRef } from './diaryStore';
 import type { GrowmiesState } from './growmiesStore';
-import { requireAtLeastOneSuccess } from './networkResult';
+import { publishWithDiagnostics, type PublishSummary } from './networkResult';
 import { assertNoSensitiveMaterial } from './securityBaseline';
 import { LocalSigner } from './signers/localSigner';
 import { ensureSignerBoundIdentity, getDefaultSigner, setLocalSignerPrivkey } from './signers/signerManager';
 import type { Signer } from './signers/types';
 import { eventValidator } from './eventValidator';
 import { decodeCustomPlantSlug, encodeCustomPlantSlug, getPlantBySlug } from './plants/catalog';
+import { extractMediaFromContent, parseMediaFromEventTags } from './mediaExtraction';
+import { diagnostics } from './diagnostics';
 
 const DIARY_KIND = 30078;
 const GROWMIES_KIND = 30000;
+
+function logPublishSummary(summary: PublishSummary, label: string) {
+  const successCount = summary.successCount;
+  const failureCount = summary.failureCount;
+  const total = successCount + failureCount;
+
+  diagnostics.log(`${label}: ${successCount}/${total} relays accepted`, successCount > 0 ? 'info' : 'error');
+
+  summary.diagnostics.forEach(d => {
+    if (!d.success && d.message) {
+      const prefix = d.prefix ? ` [${d.prefix}]` : '';
+      diagnostics.log(`Relay ${d.relay} rejected:${prefix} ${d.message}`, 'warn');
+    }
+  });
+}
 
 export interface RemoteDiary {
   id: string;
@@ -29,6 +46,27 @@ export interface RemoteDiary {
   updatedAt: number;
   isPublic: boolean;
   items: DiaryItemRef[];
+}
+
+function isValidImageUrl(value?: string): value is string {
+  if (typeof value !== 'string') return false;
+  return /^https?:\/\//i.test(value.trim());
+}
+
+function firstItemImage(item: DiaryItemRef): string | undefined {
+  if (isValidImageUrl(item.image)) return item.image.trim();
+  if (Array.isArray(item.mediaUrls)) {
+    for (const media of item.mediaUrls) {
+      if (isValidImageUrl(media)) return media.trim();
+    }
+  }
+  if (typeof item.contentPreview === 'string' && item.contentPreview.trim().length > 0) {
+    const extracted = extractMediaFromContent(item.contentPreview);
+    for (const image of extracted.images) {
+      if (isValidImageUrl(image)) return image.trim();
+    }
+  }
+  return undefined;
 }
 
 async function signUnsignedEvent(unsignedEvent: UnsignedEvent, authState: AuthState): Promise<NostrEvent> {
@@ -151,10 +189,17 @@ export async function publishPublicDiary(diary: Diary, authState: AuthState, rel
   }
 
   const pool = new SimplePool();
-  const signed = await signUnsignedEvent(buildDiaryUnsignedEvent(diary, authState.pubkey), authState);
-
-  await requireAtLeastOneSuccess(pool.publish(relayUrls, signed), 'Failed to publish diary to relays');
-  pool.close(relayUrls);
+  try {
+    const signed = await signUnsignedEvent(buildDiaryUnsignedEvent(diary, authState.pubkey), authState);
+    const summary = await publishWithDiagnostics(
+      pool.publish(relayUrls, signed),
+      relayUrls,
+      'Failed to publish diary to relays'
+    );
+    logPublishSummary(summary, `Publish Diary "${diary.title}"`);
+  } finally {
+    pool.close(relayUrls);
+  }
 }
 
 export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): Promise<RemoteDiary[]> {
@@ -164,8 +209,7 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
   const filter: Filter = {
     kinds: [DIARY_KIND],
     authors: [pubkey],
-    '#t': ['weedoshi-diary'],
-    limit: 50,
+    limit: 120,
   };
 
   try {
@@ -177,8 +221,17 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
 
     const latestByDiary = new Map<string, NostrEvent>();
     for (const event of validEvents) {
-      const dTag = event.tags.find((tag) => tag[0] === 'd')?.[1] || '';
-      const diaryId = dTag.replace(/^diary-/, '').trim();
+      const dTag = event.tags.find((tag) => tag[0] === 'd')?.[1]?.trim() || '';
+      const hasPublicDiaryTag = event.tags.some(
+        (tag) => tag[0] === 't' && typeof tag[1] === 'string' && tag[1].toLowerCase() === 'weedoshi-diary'
+      );
+      const hasLegacyDiaryTag = event.tags.some(
+        (tag) => tag[0] === 't' && typeof tag[1] === 'string' && tag[1].toLowerCase() === 'weedoshi'
+      );
+      const isDiaryPrefixedDTag = dTag.toLowerCase().startsWith('diary-');
+      if (!hasPublicDiaryTag && !hasLegacyDiaryTag && !isDiaryPrefixedDTag) continue;
+
+      const diaryId = (isDiaryPrefixedDTag ? dTag.replace(/^diary-/i, '') : dTag).trim();
       if (!diaryId) continue;
       const current = latestByDiary.get(diaryId);
       if (!current || current.created_at < event.created_at) {
@@ -187,6 +240,7 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
     }
 
     const remote: RemoteDiary[] = [];
+    const unresolvedEventIds = new Set<string>();
     for (const [id, event] of latestByDiary) {
       try {
         const getTagValue = (key: string): string | undefined => {
@@ -214,7 +268,42 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
 
         const eTags = event.tags.filter((tag) => tag[0] === 'e' && typeof tag[1] === 'string').map((tag) => tag[1]);
         const parsedItems = Array.isArray(parsed.items) ? parsed.items : [];
-        const itemMap = new Map(parsedItems.map((item) => [item.eventId, item]));
+        const legacyEntries = Array.isArray((parsed as { entries?: unknown[] }).entries)
+          ? ((parsed as { entries?: unknown[] }).entries as unknown[])
+          : [];
+        const normalizedParsedItems: DiaryItemRef[] = parsedItems
+          .filter((item): item is DiaryItemRef => Boolean(item && typeof item.eventId === 'string' && item.eventId.trim().length > 0))
+          .map((item) => {
+            const mediaUrls = Array.isArray(item.mediaUrls)
+              ? item.mediaUrls.filter((url): url is string => typeof url === 'string' && url.trim().length > 0)
+              : undefined;
+            return {
+              eventId: item.eventId,
+              authorPubkey: item.authorPubkey || pubkey,
+              createdAt: typeof item.createdAt === 'number' ? item.createdAt : event.created_at,
+              addedAt: typeof item.addedAt === 'number' ? item.addedAt : event.created_at,
+              contentPreview: typeof item.contentPreview === 'string' ? item.contentPreview : '',
+              image: typeof item.image === 'string' ? item.image : undefined,
+              mediaUrls: mediaUrls && mediaUrls.length > 0 ? mediaUrls : undefined,
+              phaseLabel: typeof item.phaseLabel === 'string' ? item.phaseLabel : undefined,
+            };
+          });
+        if (normalizedParsedItems.length === 0 && legacyEntries.length > 0) {
+          for (const entry of legacyEntries) {
+            if (!entry || typeof entry !== 'object') continue;
+            const candidate = entry as { id?: unknown; addedAt?: unknown; chapter?: unknown };
+            if (typeof candidate.id !== 'string' || candidate.id.trim().length === 0) continue;
+            normalizedParsedItems.push({
+              eventId: candidate.id.trim(),
+              authorPubkey: pubkey,
+              createdAt: typeof candidate.addedAt === 'number' ? candidate.addedAt : event.created_at,
+              addedAt: typeof candidate.addedAt === 'number' ? candidate.addedAt : event.created_at,
+              contentPreview: '',
+              phaseLabel: typeof candidate.chapter === 'string' ? candidate.chapter : undefined,
+            });
+          }
+        }
+        const itemMap = new Map(normalizedParsedItems.map((item) => [item.eventId, item]));
         for (const idTag of eTags) {
           if (!itemMap.has(idTag)) {
             itemMap.set(idTag, {
@@ -226,10 +315,15 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
             });
           }
         }
+        for (const ref of itemMap.values()) {
+          if (!firstItemImage(ref)) {
+            unresolvedEventIds.add(ref.eventId);
+          }
+        }
 
         remote.push({
           id,
-          title: parsed.title?.trim() || id,
+          title: parsed.title?.trim() || getTagValue('title') || id,
           plant:
             (typeof parsed.plant === 'string' ? parsed.plant.trim() || undefined : undefined) ||
             customPlant ||
@@ -251,7 +345,7 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
             getTagValue('a') ||
             (typeof parsed.plantWikiAPointer === 'string' ? parsed.plantWikiAPointer.trim() || undefined : undefined),
           phase: typeof parsed.phase === 'string' ? parsed.phase.trim() || undefined : undefined,
-          coverImage: typeof parsed.coverImage === 'string' ? parsed.coverImage.trim() || undefined : undefined,
+          coverImage: isValidImageUrl(parsed.coverImage) ? parsed.coverImage.trim() : undefined,
           createdAt: parsed.createdAt || event.created_at,
           updatedAt: parsed.updatedAt || event.created_at,
           isPublic: true,
@@ -259,6 +353,52 @@ export async function fetchPublicDiaries(pubkey: string, relayUrls: string[]): P
         });
       } catch {
         continue;
+      }
+    }
+
+    if (unresolvedEventIds.size > 0) {
+      const ids = Array.from(unresolvedEventIds);
+      const mediaEvents = await pool.querySync(
+        relayUrls,
+        { ids, limit: Math.min(ids.length * 2, 400) },
+        { maxWait: 5000, label: 'fetch-diary-item-media' }
+      );
+      const byId = new Map(
+        mediaEvents
+          .filter((event) => eventValidator.validateEvent(event))
+          .map((event) => [event.id, event] as const)
+      );
+
+      for (const diary of remote) {
+        for (const item of diary.items) {
+          if (firstItemImage(item)) continue;
+          const source = byId.get(item.eventId);
+          if (!source) continue;
+          const tagMedia = parseMediaFromEventTags(source);
+          const textMedia = extractMediaFromContent(source.content || '');
+          const mergedMedia = Array.from(
+            new Set([...tagMedia.images, ...tagMedia.videos, ...textMedia.images, ...textMedia.videos])
+          );
+          if (!item.contentPreview && source.content) {
+            item.contentPreview = source.content;
+          }
+          if (!item.image) {
+            item.image = tagMedia.images[0] || textMedia.images[0];
+          }
+          if ((!item.mediaUrls || item.mediaUrls.length === 0) && mergedMedia.length > 0) {
+            item.mediaUrls = mergedMedia;
+          }
+        }
+
+        if (!isValidImageUrl(diary.coverImage)) {
+          for (const item of diary.items) {
+            const image = firstItemImage(item);
+            if (image) {
+              diary.coverImage = image;
+              break;
+            }
+          }
+        }
       }
     }
 
@@ -277,9 +417,17 @@ export async function publishGrowmiesList(state: GrowmiesState, authState: AuthS
   }
 
   const pool = new SimplePool();
-  const signed = await signUnsignedEvent(buildGrowmiesUnsignedEvent(state, authState.pubkey), authState);
-  await requireAtLeastOneSuccess(pool.publish(relayUrls, signed), 'Failed to publish Growmies list');
-  pool.close(relayUrls);
+  try {
+    const signed = await signUnsignedEvent(buildGrowmiesUnsignedEvent(state, authState.pubkey), authState);
+    const summary = await publishWithDiagnostics(
+      pool.publish(relayUrls, signed),
+      relayUrls,
+      'Failed to publish Growmies list'
+    );
+    logPublishSummary(summary, 'Publish Growmies');
+  } finally {
+    pool.close(relayUrls);
+  }
 }
 
 export async function fetchGrowmiesList(pubkey: string, relayUrls: string[]): Promise<{ authors: string[] } | null> {

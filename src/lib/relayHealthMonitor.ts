@@ -6,7 +6,9 @@ export interface RelayHealth {
   avgLatency: number;
   successRate: number;
   lastSuccessTime: number;
-  failureCount: number;
+  failureCount: number; // consecutive failures
+  totalSuccesses: number;
+  totalFailures: number;
   eventsReceived: number;
   connectionAttempts: number;
   lastError?: string;
@@ -35,6 +37,8 @@ export class RelayHealthMonitor {
         successRate: 100,
         lastSuccessTime: 0,
         failureCount: 0,
+        totalSuccesses: 0,
+        totalFailures: 0,
         eventsReceived: 0,
         connectionAttempts: 0,
       });
@@ -93,6 +97,7 @@ export class RelayHealthMonitor {
     
     health.lastSuccessTime = Date.now();
     health.failureCount = 0; // Reset failure count on success
+    health.totalSuccesses++;
     health.eventsReceived++;
     
     // Update success rate
@@ -112,6 +117,7 @@ export class RelayHealthMonitor {
     const health = this.health.get(url)!;
     
     health.failureCount++;
+    health.totalFailures++;
     health.lastError = error;
     
     // Update success rate
@@ -135,9 +141,13 @@ export class RelayHealthMonitor {
   private updateSuccessRate(url: string): void {
     const health = this.health.get(url);
     if (!health || health.connectionAttempts === 0) return;
-    
-    const successCount = health.connectionAttempts - health.failureCount;
-    health.successRate = Math.round((successCount / health.connectionAttempts) * 100);
+
+    const attempts = Math.max(health.totalSuccesses + health.totalFailures, health.connectionAttempts);
+    if (attempts <= 0) {
+      health.successRate = 100;
+      return;
+    }
+    health.successRate = Math.round((health.totalSuccesses / attempts) * 100);
   }
 
   /**

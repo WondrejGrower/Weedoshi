@@ -15,8 +15,22 @@ export interface DiagnosticsInfo {
 class Diagnostics {
   private logs: string[] = [];
   private maxLogs = 50;
+  private recentInfoLogs: Map<string, number> = new Map();
+  private infoDedupWindowMs = 1500;
 
   log(message: string, level: 'info' | 'warn' | 'error' = 'info') {
+    if (level === 'info') {
+      const now = Date.now();
+      const last = this.recentInfoLogs.get(message) || 0;
+      if (now - last < this.infoDedupWindowMs) {
+        return;
+      }
+      this.recentInfoLogs.set(message, now);
+      if (this.recentInfoLogs.size > 200) {
+        this.recentInfoLogs.clear();
+      }
+    }
+
     const timestamp = new Date().toISOString();
     const logEntry = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
     

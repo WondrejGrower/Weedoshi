@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useRouter, type Href } from 'expo-router';
 import {
   View,
@@ -16,22 +16,17 @@ import {
   useWindowDimensions,
   Animated,
 } from 'react-native';
+import * as Clipboard from 'expo-clipboard';
 import type { Event as NostrRawEvent } from 'nostr-tools';
 import { nostrClient } from '../src/lib/nostrClient';
 import { authManager } from '../src/lib/authManager';
 import { relayManager } from '../src/lib/relayManager';
-import { ReactionBar } from '../src/components/ReactionBar';
-import { ThreadIndicator } from '../src/components/ThreadIndicator';
-import { PostMediaRenderer } from '../src/components/PostMediaRenderer';
-import { reactionManager } from '../src/lib/reactionManager';
 import type { NostrProfileMetadata } from '../src/lib/nostrClient';
-import type { AuthState, Nip46PairingState } from '../src/lib/authManager';
+import type { AuthState } from '../src/lib/authManager';
 import { getRuntimeMode } from '../src/runtime/mode';
 import { getFeatures } from '../src/runtime/features';
 import {
-  diaryManager,
   defaultDiaryId,
-  fetchAuthorNotes,
   type DiaryIndex,
 } from '../src/lib/diaryManager';
 import { diaryStore, type Diary, type DiaryDetailsInput } from '../src/lib/diaryStore';
@@ -42,10 +37,9 @@ import {
   shortPubkey,
 } from '../src/features/home/profileHelpers';
 import { useFeedController } from '../src/features/feed/useFeedController';
-import { logger } from '../src/lib/logger';
 import { assertNoSensitiveMaterial } from '../src/lib/securityBaseline';
 import { getAllHashtags } from '../src/lib/eventFilter';
-import { getJson, setJson } from '../src/lib/persistentStorage';
+import { setJson } from '../src/lib/persistentStorage';
 import { extractMediaFromContent } from '../src/lib/mediaExtraction';
 import { normalizePlantDTagSlug } from '../src/lib/plants/catalog';
 import type { PlantSelection } from '../src/lib/plants/types';
@@ -53,21 +47,23 @@ import { FeedPage } from '../src/features/home/components/FeedPage';
 import { GrowmiesPage } from '../src/features/home/components/GrowmiesPage';
 import { SettingsPage } from '../src/features/home/components/SettingsPage';
 import { ProfilePage } from '../src/features/home/components/ProfilePage';
+import { useHomeShellState, type SettingsSection } from '../src/features/home/hooks/useHomeShellState';
+import { useAuthActions } from '../src/features/home/hooks/useAuthActions';
+import { useFeedSettingsActions } from '../src/features/home/hooks/useFeedSettingsActions';
+import { useHomeDataSync } from '../src/features/home/hooks/useHomeDataSync';
+import { useFeedAuthorNames } from '../src/features/home/hooks/useFeedAuthorNames';
 import {
   buildFeedSearchSuggestions,
   eventMatchesFeedQuery,
   splitFeedQueryTerms,
 } from '../src/features/home/feedSearch';
-import { toErrorMessage } from '../src/lib/errorUtils';
+import { FeedEventCard } from '../src/features/home/components/FeedEventCard';
 
 const runtimeMode = getRuntimeMode();
 const features = getFeatures(runtimeMode);
 
-type MainPage = 'feed' | 'profile' | 'growmies' | 'settings';
 type ProfileTab = 'diary' | 'all';
-type SettingsSection = 'authentication' | 'relays' | 'hashtags' | 'growmies';
 const LOGIN_PROMPT_DISMISSED_KEY = 'login_prompt_dismissed_v1';
-const ANONYMOUS_BROWSING_ENABLED_KEY = 'anonymous_browsing_enabled_v1';
 const PHASE_TEMPLATE_OPTIONS = ['Seedling', 'Vegetation', 'Flowering', 'Harvest'];
 
 function getDiaryCoverForCard(diary: Diary): string | undefined {
@@ -94,18 +90,41 @@ export default function HomeScreen() {
   const router = useRouter();
   const { width } = useWindowDimensions();
   const isMobile = width < 700;
-  const [activePage, setActivePage] = useState<MainPage>('profile');
+  const [authState, setAuthState] = useState<AuthState>(authManager.getState());
+  const {
+    activePage,
+    setActivePage,
+    settingsMenuOpen,
+    setSettingsMenuOpen,
+    settingsSection,
+    setSettingsSection,
+    loginPromptDismissed,
+    setLoginPromptDismissed,
+    loginPromptLoaded,
+    loginPromptMenuOpen,
+    setLoginPromptMenuOpen,
+    anonymousBrowsingEnabled,
+    themeMode,
+    toggleThemeMode,
+    settingsMenuAnim,
+    signerAvailable,
+    nip46Available,
+    nip46BridgePresent,
+    nip46PairingState,
+    setNip46PairingState,
+    nip46PairingInput,
+    setNip46PairingInput,
+    nip46PairingBusy,
+    setNip46PairingBusy,
+    enableAnonymousBrowsing,
+    disableAnonymousBrowsing,
+    refreshSignerAvailability,
+    refreshNip46PairingState,
+    resetLoginPromptDismissed,
+  } = useHomeShellState({ isLoggedIn: authState.isLoggedIn });
   const [profileTab, setProfileTab] = useState<ProfileTab>('diary');
   const [hoveredProfileTab, setHoveredProfileTab] = useState<ProfileTab | null>(null);
-  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>('growmies');
-  const [loginPromptDismissed, setLoginPromptDismissed] = useState(false);
-  const [loginPromptLoaded, setLoginPromptLoaded] = useState(false);
-  const [loginPromptMenuOpen, setLoginPromptMenuOpen] = useState(false);
-  const [anonymousBrowsingEnabled, setAnonymousBrowsingEnabled] = useState(false);
-  const settingsMenuAnim = useRef(new Animated.Value(0)).current;
 
-  const [authState, setAuthState] = useState<AuthState>(authManager.getState());
   const [relayUrls, setRelayUrls] = useState<string[]>(relayManager.getEnabledUrls());
   const [hashtags, setHashtags] = useState<string[]>(DEFAULT_HASHTAGS);
   const [feedFilterEnabled, setFeedFilterEnabled] = useState(true);
@@ -120,17 +139,6 @@ export default function HomeScreen() {
   const [activeAuthTab, setActiveAuthTab] = useState<'nsec' | 'npub'>(
     features.allowNsecLogin ? 'nsec' : 'npub'
   );
-  const [signerAvailable, setSignerAvailable] = useState(authManager.isBrowserSignerAvailable());
-  const [nip46Available, setNip46Available] = useState(authManager.isNip46SignerAvailable());
-  const [nip46BridgePresent, setNip46BridgePresent] = useState(authManager.isNip46BridgePresent());
-  const [nip46PairingInput, setNip46PairingInput] = useState('');
-  const [nip46PairingBusy, setNip46PairingBusy] = useState(false);
-  const [nip46PairingState, setNip46PairingState] = useState<Nip46PairingState>({
-    phase: 'unavailable',
-    connectionUri: null,
-    code: null,
-    message: null,
-  });
 
   const [diaryIdInput, setDiaryIdInput] = useState(defaultDiaryId());
   const [diaryTitleInput, setDiaryTitleInput] = useState('My Grow Run #1');
@@ -161,7 +169,7 @@ export default function HomeScreen() {
   const [addToDiaryTargetId, setAddToDiaryTargetId] = useState<string | null>(null);
   const [growmies, setGrowmies] = useState<string[]>([]);
   const [onlyGrowmies, setOnlyGrowmies] = useState(false);
-  const [feedAuthorNames, setFeedAuthorNames] = useState<Record<string, string>>({});
+  const [npubCopied, setNpubCopied] = useState(false);
   const [profileHashtagFilterEnabled, setProfileHashtagFilterEnabled] = useState(false);
   const [profileHashtags, setProfileHashtags] = useState<string[]>([]);
   const [newProfileHashtag, setNewProfileHashtag] = useState('');
@@ -169,8 +177,10 @@ export default function HomeScreen() {
   const {
     events,
     isLoading,
+    isFetchingMore,
     subscribeFeed,
     refresh: refreshFeed,
+    loadMore,
   } = useFeedController({
     relayUrls,
     hashtags,
@@ -178,6 +188,7 @@ export default function HomeScreen() {
     searchQuery: feedSearchQuery,
     onError: setError,
   });
+  const feedAuthorNames = useFeedAuthorNames(events, relayUrls);
 
   useEffect(() => {
     const timeout = setTimeout(() => {
@@ -186,292 +197,103 @@ export default function HomeScreen() {
     return () => clearTimeout(timeout);
   }, [feedSearchInput]);
 
-  useEffect(() => {
-    setSignerAvailable(authManager.isBrowserSignerAvailable());
-    setNip46Available(authManager.isNip46SignerAvailable());
-    setNip46BridgePresent(authManager.isNip46BridgePresent());
-  }, []);
-
-  useEffect(() => {
-    let canceled = false;
-    Promise.all([
-      getJson<boolean>(LOGIN_PROMPT_DISMISSED_KEY, false),
-      getJson<boolean>(ANONYMOUS_BROWSING_ENABLED_KEY, false),
-    ])
-      .then(([promptDismissed, anonymousEnabled]) => {
-        if (canceled) return;
-        setLoginPromptDismissed(Boolean(promptDismissed));
-        setAnonymousBrowsingEnabled(Boolean(anonymousEnabled));
-      })
-      .finally(() => {
-        if (canceled) return;
-        setLoginPromptLoaded(true);
-      });
-    return () => {
-      canceled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    Animated.timing(settingsMenuAnim, {
-      toValue: settingsMenuOpen ? 1 : 0,
-      duration: settingsMenuOpen ? 160 : 120,
-      useNativeDriver: true,
-    }).start();
-  }, [settingsMenuAnim, settingsMenuOpen]);
-
-  const refreshSignerAvailability = useCallback(() => {
-    setSignerAvailable(authManager.isBrowserSignerAvailable());
-    setNip46Available(authManager.isNip46SignerAvailable());
-    setNip46BridgePresent(authManager.isNip46BridgePresent());
-  }, []);
-
-  const setErrorFromUnknown = useCallback((err: unknown, fallback: string) => {
-    setError(toErrorMessage(err, fallback));
-  }, []);
-
-  const persistLoginPromptDismissed = useCallback(async () => {
-    setLoginPromptDismissed(true);
-    await setJson(LOGIN_PROMPT_DISMISSED_KEY, true);
-  }, []);
-
-  const enableAnonymousBrowsing = useCallback(async () => {
-    setAnonymousBrowsingEnabled(true);
-    await setJson(ANONYMOUS_BROWSING_ENABLED_KEY, true);
-    await persistLoginPromptDismissed();
-    setLoginPromptMenuOpen(false);
-    setActivePage('feed');
-    setSettingsSection('authentication');
-  }, [persistLoginPromptDismissed]);
-
-  const disableAnonymousBrowsing = useCallback(async () => {
-    setAnonymousBrowsingEnabled(false);
-    await setJson(ANONYMOUS_BROWSING_ENABLED_KEY, false);
-  }, []);
-
-  const refreshNip46PairingState = useCallback(async () => {
-    const state = await authManager.getNip46PairingState();
-    setNip46PairingState(state);
-  }, []);
-
-  useEffect(() => {
-    refreshNip46PairingState().catch(() => {
-      // best-effort status load
-    });
-  }, [refreshNip46PairingState]);
-
-  useEffect(() => {
-    if (!authState.isLoggedIn || loginPromptDismissed) return;
-    persistLoginPromptDismissed().catch(() => {
-      // best-effort persistence only
-    });
-  }, [authState.isLoggedIn, loginPromptDismissed, persistLoginPromptDismissed]);
-
-  useEffect(() => {
-    if (!loginPromptLoaded) return;
-    if (authState.isLoggedIn) return;
-    if (!anonymousBrowsingEnabled) return;
-    setActivePage('feed');
-  }, [authState.isLoggedIn, anonymousBrowsingEnabled, loginPromptLoaded]);
-
-  const hydrateDiaryStateFromStore = useCallback(async (preferredDiaryId?: string) => {
-    const diaries = diaryStore.listDiaries();
-    const options: DiaryRunOption[] = diaries.map((diary) => ({
-      diaryId: diary.id,
-      title: diary.title,
-      isPublic: diary.isPublic,
-      syncStatus: diary.syncStatus,
-      itemCount: diary.items.length,
-    }));
-    setRunOptions(options);
-
-    const selectedId =
-      preferredDiaryId ||
-      diaryStore.getSelectedDiaryId() ||
-      options[0]?.diaryId ||
-      null;
-
-    if (!selectedId) {
-      setDiaryDraft(null);
-      setDiaryIdInput(defaultDiaryId());
-      setDiaryTitleInput('My Grow Run #1');
-      setDiaryPlantInput('');
-      setDiaryPlantSlug('');
-      setDiarySpeciesInput('');
-      setDiaryCultivarInput('');
-      setDiaryBreederInput('');
-      setDiaryPlantWikiAPointer('');
-      setDiaryPhaseInput('');
-      return;
-    }
-
-    await diaryStore.selectDiary(selectedId);
-    const selected = diaryStore.getDiary(selectedId);
-    if (!selected) return;
-
-    const nextDraft: DiaryIndex = {
-      version: 1,
-      diaryId: selected.id,
-      title: selected.title,
-      defaultRelayHints: relayUrls,
-      chapters: [],
-      entries: selected.items.map((item) => ({
-        id: item.eventId,
-        chapter: item.phaseLabel || selected.phase || 'General',
-        addedAt: item.addedAt,
-      })),
-    };
-
-    setDiaryDraft(nextDraft);
-    setDiaryIdInput(selected.id);
-    setDiaryTitleInput(selected.title);
-    setDiaryPlantInput(selected.plant || '');
-    setDiaryPlantSlug(selected.plantSlug || '');
-    setDiarySpeciesInput(selected.species || '');
-    setDiaryCultivarInput(selected.cultivar || '');
-    setDiaryBreederInput(selected.breeder || '');
-    setDiaryPlantWikiAPointer(selected.plantWikiAPointer || '');
-    setDiaryPhaseInput(selected.phase || '');
-    setDiaryMoreOpen(false);
-
-  }, [relayUrls]);
-
-  const hydrateGrowmiesState = useCallback(() => {
-    setGrowmies(growmiesStore.list());
-    setOnlyGrowmies(growmiesStore.isOnlyGrowmies());
-  }, []);
-
-  const syncRelaysAndProfile = useCallback(async (pubkey: string): Promise<string[]> => {
-    const currentRelays = relayManager.getEnabledUrls();
-    const allKnownRelays = relayManager.getAllRelays().map((relay) => relay.url);
-    const seedRelays = Array.from(new Set([...currentRelays, ...allKnownRelays])).slice(0, 12);
-
-    const userRelays = await nostrClient.fetchUserRelayPreferences(pubkey, seedRelays, 7000);
-    const prioritizedUserRelays = userRelays.slice(0, 10);
-
-    if (prioritizedUserRelays.length > 0) {
-      for (const relayUrl of prioritizedUserRelays) {
-        try {
-          relayManager.addRelay(relayUrl);
-          relayManager.enableRelay(relayUrl);
-        } catch (relayError) {
-          logger.warn('Skipping invalid user relay', relayUrl, relayError);
-        }
-      }
-    }
-
-    const mergedRelays = relayManager.getEnabledUrls();
-    setRelayUrls(mergedRelays);
-    nostrClient.setRelays(mergedRelays);
-
-    const metadata = await nostrClient.fetchProfileMetadata(pubkey, mergedRelays, 7000);
-    setProfileMetadata(metadata);
-    return mergedRelays;
-  }, []);
-
-  const loadDiary = useCallback(async (forcedDiaryId?: string) => {
-    if (!authState.pubkey) return;
-    setDiaryLoading(true);
-    try {
-      await diaryStore.setUser(authState.pubkey);
-      await hydrateDiaryStateFromStore(forcedDiaryId);
-
-      if (relayUrls.length > 0) {
-        await diaryStore.mergePublicDiariesFromRelays(authState.pubkey, relayUrls);
-        await hydrateDiaryStateFromStore(forcedDiaryId);
-      }
-    } catch (err) {
-      setErrorFromUnknown(err, 'Failed to load diary');
-    } finally {
-      setDiaryLoading(false);
-    }
-  }, [authState.pubkey, relayUrls, hydrateDiaryStateFromStore, setErrorFromUnknown]);
-
-  const loadAuthorPosts = useCallback(async (relayOverride?: string[]) => {
-    if (!authState.pubkey) return;
-    const activeRelays = relayOverride && relayOverride.length > 0 ? relayOverride : relayUrls;
-    if (activeRelays.length === 0) return;
-
-    setProfileLoading(true);
-    try {
-      let notes = await fetchAuthorNotes(diaryManager.getPool(), activeRelays, authState.pubkey, 180);
-
-      if (notes.length === 0) {
-        const fallbackRelays = Array.from(
-          new Set([...activeRelays, ...relayManager.getAllRelays().map((relay) => relay.url)])
-        );
-        notes = await fetchAuthorNotes(diaryManager.getPool(), fallbackRelays, authState.pubkey, 180);
-      }
-
-      setProfilePosts(notes);
-    } catch (err) {
-      setErrorFromUnknown(err, 'Failed to load profile posts');
-    } finally {
-      setProfileLoading(false);
-    }
-  }, [authState.pubkey, relayUrls, setErrorFromUnknown]);
-
-  const bootstrapLoggedInSession = useCallback(async (pubkey: string) => {
-    const syncedRelays = await syncRelaysAndProfile(pubkey);
-    await Promise.all([subscribeFeed(syncedRelays), loadAuthorPosts(syncedRelays)]);
-  }, [loadAuthorPosts, subscribeFeed, syncRelaysAndProfile]);
-
-  useEffect(() => {
-    if (!authState.isLoggedIn || !authState.pubkey) {
-      setDiaryDraft(null);
-      setProfilePosts([]);
-      setRunOptions([]);
-      setDiaryEditMode(false);
-      setProfileMetadata(null);
-      setLastSyncedPubkey(null);
-      setGrowmies([]);
-      setOnlyGrowmies(false);
-      diaryStore.setUser(null).catch(() => {
-        // ignore
-      });
-      growmiesStore.setUser(null).catch(() => {
-        // ignore
-      });
-      return;
-    }
-
-    if (lastSyncedPubkey !== authState.pubkey) {
-      setLastSyncedPubkey(authState.pubkey);
-      syncRelaysAndProfile(authState.pubkey).catch((err) => {
-        setErrorFromUnknown(err, 'Failed to sync user relays/profile');
-      });
-    }
-
-    loadDiary().catch((err) => {
-      setErrorFromUnknown(err, 'Failed to load diary');
-    });
-    growmiesStore
-      .setUser(authState.pubkey)
-      .then(async () => {
-        if (relayUrls.length > 0) {
-          await growmiesStore.mergeFromRelays(authState.pubkey!, relayUrls);
-        }
-        hydrateGrowmiesState();
-      })
-      .catch((err) => {
-        setErrorFromUnknown(err, 'Failed to load Growmies');
-      });
-    loadAuthorPosts().catch((err) => {
-      setErrorFromUnknown(err, 'Failed to load profile posts');
-    });
-  }, [
-    authState.isLoggedIn,
-    authState.pubkey,
-    relayUrls,
-    lastSyncedPubkey,
-    syncRelaysAndProfile,
-    loadDiary,
-    hydrateGrowmiesState,
-    loadAuthorPosts,
+  const {
     setErrorFromUnknown,
-  ]);
+    hydrateDiaryStateFromStore,
+    hydrateGrowmiesState,
+    loadDiary,
+    loadAuthorPosts,
+    bootstrapLoggedInSession,
+  } = useHomeDataSync({
+    authState,
+    relayUrls,
+    setRelayUrls,
+    setError,
+    setDiaryDraft,
+    setDiaryIdInput,
+    setDiaryTitleInput,
+    setDiaryPlantInput,
+    setDiaryPlantSlug,
+    setDiarySpeciesInput,
+    setDiaryCultivarInput,
+    setDiaryBreederInput,
+    setDiaryPlantWikiAPointer,
+    setDiaryPhaseInput,
+    setDiaryMoreOpen,
+    setRunOptions,
+    setDiaryLoading,
+    setProfileLoading,
+    setProfilePosts,
+    setProfileMetadata,
+    setLastSyncedPubkey,
+    lastSyncedPubkey,
+    setDiaryEditMode,
+    setGrowmies,
+    setOnlyGrowmies,
+    subscribeFeed,
+  });
 
-  const openAddToDiaryModal = (event: NostrRawEvent) => {
+  const {
+    handleLogin,
+    handleConnectSigner,
+    handleConnectNip46,
+    handleDisconnectNip46,
+    handleStartNip46Pairing,
+    handleApproveNip46Pairing,
+    handleRefreshNip46Pairing,
+    handleLogout,
+  } = useAuthActions({
+    activeAuthTab,
+    nsecInput,
+    npubInput,
+    allowNsecLogin: features.allowNsecLogin,
+    nip46PairingInput,
+    setAuthState,
+    setNsecInput,
+    setNpubInput,
+    setError,
+    setErrorFromUnknown,
+    setDiaryEditMode,
+    setProfileMetadata,
+    setLastSyncedPubkey,
+    setNip46PairingBusy,
+    setNip46PairingState,
+    disableAnonymousBrowsing,
+    enableAnonymousBrowsing,
+    resetLoginPromptDismissed,
+    refreshSignerAvailability,
+    refreshNip46PairingState,
+    bootstrapLoggedInSession,
+  });
+
+  const {
+    handleToggleRelay,
+    handleAddRelay,
+    handleRemoveRelay,
+    handleAddHashtag,
+    handleRemoveHashtag,
+    handleResetDefaultHashtags,
+    handleAddProfileHashtag,
+    handleRemoveProfileHashtag,
+    handleRefresh,
+  } = useFeedSettingsActions({
+    newRelay,
+    setNewRelay,
+    setRelayUrls,
+    newHashtag,
+    setNewHashtag,
+    hashtags,
+    setHashtags,
+    setFeedFilterEnabled,
+    newProfileHashtag,
+    profileHashtags,
+    setProfileHashtags,
+    setNewProfileHashtag,
+    setError,
+    refreshFeed,
+  });
+
+  const openAddToDiaryModal = useCallback((event: NostrRawEvent) => {
     if (!authState.isLoggedIn || !authState.pubkey) {
       setError('Login is required to add post to diary.');
       return;
@@ -484,7 +306,7 @@ export default function HomeScreen() {
     setAddToDiaryModalOpen(true);
     setActivePage('profile');
     setProfileTab('diary');
-  };
+  }, [authState.isLoggedIn, authState.pubkey, runOptions, setActivePage]);
 
   const handleConfirmAddToDiary = async () => {
     if (!authState.pubkey || !addToDiaryEvent) return;
@@ -517,7 +339,7 @@ export default function HomeScreen() {
     }
   };
 
-  const handleAddToGrowmies = async (authorPubkey: string) => {
+  const handleAddToGrowmies = useCallback(async (authorPubkey: string) => {
     if (!authState.pubkey) {
       setError('Login required to manage Growmies');
       return;
@@ -528,7 +350,7 @@ export default function HomeScreen() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add Growmie');
     }
-  };
+  }, [authState.pubkey, hydrateGrowmiesState]);
 
   const handlePublishDiaryChanges = async () => {
     if (!diaryDraft) return;
@@ -656,202 +478,12 @@ export default function HomeScreen() {
     );
   }, [hydrateDiaryStateFromStore, setErrorFromUnknown]);
 
-  const handleLogin = async () => {
-    try {
-      setError(null);
-      if (activeAuthTab === 'nsec') {
-        if (!features.allowNsecLogin) {
-          throw new Error('nsec login is disabled in web mode. Connect a browser signer.');
-        }
-        if (!nsecInput.trim()) throw new Error('nsec cannot be empty');
-        await authManager.loginWithNsec(nsecInput.trim());
-      } else {
-        if (!npubInput.trim()) throw new Error('npub cannot be empty');
-        await authManager.loginWithNpub(npubInput.trim());
-      }
-      const newState = authManager.getState();
-      setAuthState(newState);
-      await disableAnonymousBrowsing();
-      setNsecInput('');
-      setNpubInput('');
-      refreshSignerAvailability();
-      await refreshNip46PairingState();
-      if (newState.pubkey) {
-        await bootstrapLoggedInSession(newState.pubkey);
-      }
-    } catch (err) {
-      setErrorFromUnknown(err, 'Login failed');
-    }
-  };
-
-  const handleConnectSigner = async () => {
-    try {
-      setError(null);
-      await authManager.loginWithSignerFirst();
-      const newState = authManager.getState();
-      setAuthState(newState);
-      await disableAnonymousBrowsing();
-      refreshSignerAvailability();
-      await refreshNip46PairingState();
-      if (newState.pubkey) {
-        await bootstrapLoggedInSession(newState.pubkey);
-      }
-    } catch (err) {
-      setErrorFromUnknown(err, 'Failed to connect signer');
-    }
-  };
-
-  const handleConnectNip46 = async () => {
-    try {
-      setError(null);
-      await authManager.connectNip46Session();
-      const newState = authManager.getState();
-      setAuthState(newState);
-      await disableAnonymousBrowsing();
-      refreshSignerAvailability();
-      await refreshNip46PairingState();
-      if (newState.pubkey) {
-        await bootstrapLoggedInSession(newState.pubkey);
-      }
-    } catch (err) {
-      setErrorFromUnknown(err, 'Failed to connect NIP-46');
-    }
-  };
-
-  const handleDisconnectNip46 = async () => {
-    try {
-      setError(null);
-      await authManager.disconnectNip46Session();
-      setAuthState(authManager.getState());
-      refreshSignerAvailability();
-      await refreshNip46PairingState();
-      setDiaryEditMode(false);
-      setProfileMetadata(null);
-      setLastSyncedPubkey(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to disconnect NIP-46');
-    }
-  };
-
-  const handleStartNip46Pairing = async () => {
-    try {
-      setError(null);
-      setNip46PairingBusy(true);
-      const state = await authManager.startNip46Pairing(nip46PairingInput);
-      setNip46PairingState(state);
-      refreshSignerAvailability();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start NIP-46 pairing');
-    } finally {
-      setNip46PairingBusy(false);
-    }
-  };
-
-  const handleApproveNip46Pairing = async () => {
-    try {
-      setError(null);
-      setNip46PairingBusy(true);
-      const state = await authManager.approveNip46Pairing();
-      setNip46PairingState(state);
-      refreshSignerAvailability();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to approve NIP-46 pairing');
-    } finally {
-      setNip46PairingBusy(false);
-    }
-  };
-
-  const handleRefreshNip46Pairing = async () => {
-    try {
-      setNip46PairingBusy(true);
-      await refreshNip46PairingState();
-      refreshSignerAvailability();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to refresh NIP-46 pairing status');
-    } finally {
-      setNip46PairingBusy(false);
-    }
-  };
-
   const handleOpenApp = async () => {
     try {
       await Linking.openURL('weedoshi://');
     } catch {
       setError('Could not open app deep link. Install the app and try again.');
     }
-  };
-
-  const handleLogout = async () => {
-    await authManager.logout();
-    setAuthState(authManager.getState());
-    await enableAnonymousBrowsing();
-    refreshSignerAvailability();
-    await refreshNip46PairingState();
-    setDiaryEditMode(false);
-    setProfileMetadata(null);
-    setLastSyncedPubkey(null);
-  };
-
-  const handleToggleRelay = (url: string) => {
-    const enabled = relayManager.getEnabledUrls().includes(url);
-    if (enabled) {
-      relayManager.disableRelay(url);
-    } else {
-      relayManager.enableRelay(url);
-    }
-    setRelayUrls(relayManager.getEnabledUrls());
-  };
-
-  const handleAddRelay = () => {
-    try {
-      if (!newRelay.trim()) throw new Error('Relay URL cannot be empty');
-      if (!newRelay.startsWith('wss://')) throw new Error('Relay URL must start with wss://');
-      relayManager.addRelay(newRelay.trim());
-      setRelayUrls(relayManager.getEnabledUrls());
-      setNewRelay('');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to add relay');
-    }
-  };
-
-  const handleRemoveRelay = (url: string) => {
-    relayManager.removeRelay(url);
-    setRelayUrls(relayManager.getEnabledUrls());
-  };
-
-  const handleAddHashtag = () => {
-    try {
-      if (!newHashtag.trim()) throw new Error('Hashtag cannot be empty');
-      const tag = newHashtag.trim().toLowerCase().replace(/^#+/, '');
-      if (!hashtags.includes(tag)) {
-        setHashtags([...hashtags, tag]);
-      }
-      setNewHashtag('');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to add hashtag');
-    }
-  };
-
-  const handleRemoveHashtag = (tag: string) => {
-    setHashtags(hashtags.filter((h) => h !== tag));
-  };
-
-  const handleResetDefaultHashtags = () => {
-    setHashtags(DEFAULT_HASHTAGS);
-    setFeedFilterEnabled(true);
-  };
-
-  const handleAddProfileHashtag = () => {
-    const tag = newProfileHashtag.trim().toLowerCase().replace(/^#+/, '');
-    if (!tag) return;
-    if (!profileHashtags.includes(tag)) {
-      setProfileHashtags((prev) => [...prev, tag]);
-    }
-    setNewProfileHashtag('');
-  };
-
-  const handleRemoveProfileHashtag = (tag: string) => {
-    setProfileHashtags((prev) => prev.filter((item) => item !== tag));
   };
 
   const handlePlantSelection = (selection: PlantSelection) => {
@@ -871,11 +503,6 @@ export default function HomeScreen() {
       return;
     }
     router.push(`/plant/${encodeURIComponent(slug)}?name=${encodeURIComponent(diaryPlantInput || '')}` as Href);
-  };
-
-  const handleRefresh = () => {
-    setError(null);
-    refreshFeed();
   };
 
   const collectDiaryDetailsInput = useCallback((): DiaryDetailsInput => ({
@@ -943,6 +570,14 @@ export default function HomeScreen() {
     runOptions.find((run) => run.diaryId === diaryIdInput)?.syncStatus || 'local-only';
   const profilePubkeyText = shortPubkey(authState.pubkey);
   const nip46PhaseLabel = nip46PairingState.phase.toUpperCase();
+  const profileNpub = useMemo(() => {
+    if (!authState.pubkey) return '';
+    try {
+      return nostrClient.pubkeyToNpub(authState.pubkey);
+    } catch {
+      return '';
+    }
+  }, [authState.pubkey]);
   const isReadOnlyBlocked = authState.isLoggedIn && authState.isReadOnly;
   const readOnlyBlockHint = isReadOnlyBlocked
     ? 'Read-only mode: connect signer or nsec local signer to publish.'
@@ -997,111 +632,32 @@ export default function HomeScreen() {
     return events.filter((event) => allowed.has(event.author));
   }, [events, growmies]);
 
-  const renderFeedEventCard = (event: typeof events[number], allowAddToGrowmies: boolean) => (
-    <View key={event.id} style={styles.feedItem}>
-      <View style={styles.feedItemHeader}>
-        <TouchableOpacity
-          style={styles.feedAuthorAvatar}
-          onPress={() => router.push(`/profile/${encodeURIComponent(event.author)}` as Href)}
-        >
-          <Text style={styles.feedAuthorAvatarText}>
-            {(feedAuthorNames[event.author] || shortPubkey(event.author)).slice(0, 1).toUpperCase()}
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={styles.feedAuthorMeta}
-          onPress={() => router.push(`/profile/${encodeURIComponent(event.author)}` as Href)}
-        >
-          <Text style={styles.author}>
-            {feedAuthorNames[event.author] || shortPubkey(event.author)}
-          </Text>
-          <Text style={styles.timestamp}>{event.timestamp}</Text>
-        </TouchableOpacity>
-      </View>
-      <PostMediaRenderer content={event.content} tags={event.tags} textNumberOfLines={5} />
-      <View style={styles.tagsContainer}>
-        {event.hashtags.map((tag) => (
-          <Text key={tag} style={styles.tag}>
-            #{tag}
-          </Text>
-        ))}
-      </View>
-
-      <ReactionBar
-        eventId={event.id}
-        eventAuthor={event.author}
+  const renderFeedEventCard = useCallback((event: typeof events[number], allowAddToGrowmies: boolean) => {
+    return (
+      <FeedEventCard
+        key={event.id}
+        event={event}
+        allowAddToGrowmies={allowAddToGrowmies}
+        isNight={themeMode === 'night'}
         authState={authState}
         relayUrls={relayUrls}
-        onReactionAdded={() => {
-          setTimeout(() => {
-            const eventIds = events.map((e) => e.id);
-            reactionManager.fetchInteractions(eventIds, relayUrls).catch((err) => {
-              logger.warn('Failed to refresh reactions:', err);
-            });
-          }, 500);
+        feedAuthorNames={feedAuthorNames}
+        growmies={growmies}
+        onOpenProfile={(pubkey) => router.push(`/profile/${encodeURIComponent(pubkey)}` as Href)}
+        onOpenAddToDiary={openAddToDiaryModal}
+        onAddToGrowmies={(pubkey) => {
+          handleAddToGrowmies(pubkey).catch(() => {
+            // handled in callback
+          });
         }}
       />
-
-      <ThreadIndicator eventId={event.id} />
-
-      {authState.isLoggedIn && (
-        <TouchableOpacity
-          style={styles.addToDiaryMini}
-          onPress={() => openAddToDiaryModal(event as unknown as NostrRawEvent)}
-        >
-          <Text style={styles.addToDiaryMiniText}>Add to Diary</Text>
-        </TouchableOpacity>
-      )}
-      {allowAddToGrowmies && authState.isLoggedIn && event.author !== authState.pubkey && !growmies.includes(event.author) && (
-        <TouchableOpacity style={styles.addToDiaryMini} onPress={() => handleAddToGrowmies(event.author)}>
-          <Text style={styles.addToDiaryMiniText}>Add to Growmies</Text>
-        </TouchableOpacity>
-      )}
-    </View>
-  );
-
-  useEffect(() => {
-    if (relayUrls.length === 0 || visibleFeedEvents.length === 0) return;
-
-    const missingAuthors = Array.from(
-      new Set(visibleFeedEvents.map((event) => event.author).filter((author) => !feedAuthorNames[author]))
-    ).slice(0, 12);
-
-    if (missingAuthors.length === 0) return;
-
-    let canceled = false;
-    Promise.all(
-      missingAuthors.map(async (author) => {
-        const metadata = await nostrClient.fetchProfileMetadata(author, relayUrls, 2500);
-        const label = metadata?.display_name?.trim() || metadata?.name?.trim() || '';
-        return { author, label };
-      })
-    )
-      .then((resolved) => {
-        if (canceled) return;
-        setFeedAuthorNames((prev) => {
-          const next = { ...prev };
-          for (const item of resolved) {
-            if (item.label) {
-              next[item.author] = item.label;
-            }
-          }
-          return next;
-        });
-      })
-      .catch(() => {
-        // best effort only
-      });
-
-    return () => {
-      canceled = true;
-    };
-  }, [visibleFeedEvents, relayUrls, feedAuthorNames]);
+    );
+  }, [themeMode, authState, relayUrls, feedAuthorNames, growmies, router, openAddToDiaryModal, handleAddToGrowmies]);
 
   const renderFeedPage = () => (
     <FeedPage
       isMobile={isMobile}
-      styles={styles}
+      isNight={themeMode === 'night'}
       onRefresh={handleRefresh}
       feedSearchInput={feedSearchInput}
       onFeedSearchInputChange={setFeedSearchInput}
@@ -1119,31 +675,48 @@ export default function HomeScreen() {
       onAddHashtag={handleAddHashtag}
       onResetDefaultHashtags={handleResetDefaultHashtags}
       isLoading={isLoading}
+      isFetchingMore={isFetchingMore}
       visibleFeedEvents={visibleFeedEvents}
       relayUrlsCount={relayUrls.length}
       onlyGrowmies={onlyGrowmies}
       feedSearchQuery={feedSearchQuery}
       renderFeedEventCard={renderFeedEventCard}
+      onLoadMore={loadMore}
     />
   );
 
   const renderProfilePage = () => (
     <ProfilePage
       ctx={{
-        styles,
+        isNight: themeMode === 'night',
         diaryEditMode,
         isMobile,
         authState,
         profileMetadata,
         setActivePage,
         profilePubkeyText,
+        profileNpub,
+        npubCopied,
         runOptions,
         handleOpenDiaryEditor,
+        handleCopyNpub: async () => {
+          if (!profileNpub) return;
+          try {
+            await Clipboard.setStringAsync(profileNpub);
+            setNpubCopied(true);
+            setTimeout(() => setNpubCopied(false), 1400);
+          } catch (err) {
+            setError(err instanceof Error ? err.message : 'Failed to copy npub');
+          }
+        },
         setError,
+        setLoginPromptMenuOpen,
+        setLoginPromptDismissed,
+        LOGIN_PROMPT_DISMISSED_KEY,
+        setJson,
         profilePosts,
         growmies,
         nostrSinceLabel,
-        handleLogout,
         handleCancelEdit,
         setRunMenuOpen,
         selectedRunTitle,
@@ -1205,7 +778,6 @@ export default function HomeScreen() {
 
   const renderSettingsPage = () => (
     <SettingsPage
-      styles={styles}
       isMobile={isMobile}
       settingsSection={settingsSection}
       authState={authState}
@@ -1263,8 +835,8 @@ export default function HomeScreen() {
 
   const renderGrowmiesPage = () => (
     <GrowmiesPage
-      styles={styles}
       isMobile={isMobile}
+      isNight={themeMode === 'night'}
       onRefresh={handleRefresh}
       growmiesCount={growmies.length}
       growmiesFeedEvents={growmiesFeedEvents}
@@ -1275,26 +847,36 @@ export default function HomeScreen() {
 
   const renderBottomNav = () => (
     <View style={styles.bottomNavWrap} pointerEvents="box-none">
-      <View style={styles.bottomNav}>
+      <View style={[styles.bottomNav, themeMode === 'night' && styles.bottomNavNight]}>
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Feed"
           style={({ pressed, hovered }) => [
             styles.bottomNavItem,
-            activePage === 'feed' && styles.bottomNavItemActive,
-            (pressed || hovered) && styles.bottomNavItemHover,
+            themeMode === 'night' && styles.bottomNavItemNight,
+            activePage === 'feed' && (themeMode === 'night' ? styles.bottomNavItemActiveNight : styles.bottomNavItemActive),
+            (pressed || hovered) && (themeMode === 'night' ? styles.bottomNavItemHoverNight : styles.bottomNavItemHover),
           ]}
           onPress={() => setActivePage('feed')}
         >
-          <Text style={[styles.bottomNavText, activePage === 'feed' && styles.bottomNavTextActive]}>Feed</Text>
+          <Text
+            style={[
+              styles.bottomNavText,
+              themeMode === 'night' && styles.bottomNavTextNight,
+              activePage === 'feed' && (themeMode === 'night' ? styles.bottomNavTextActiveNight : styles.bottomNavTextActive),
+            ]}
+          >
+            Feed
+          </Text>
         </Pressable>
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Profile"
           style={({ pressed, hovered }) => [
             styles.bottomNavProfileItem,
-            activePage === 'profile' && styles.bottomNavProfileItemActive,
-            (pressed || hovered) && styles.bottomNavProfileItemHover,
+            themeMode === 'night' && styles.bottomNavProfileItemNight,
+            activePage === 'profile' && (themeMode === 'night' ? styles.bottomNavProfileItemActiveNight : styles.bottomNavProfileItemActive),
+            (pressed || hovered) && (themeMode === 'night' ? styles.bottomNavProfileItemHoverNight : styles.bottomNavProfileItemHover),
           ]}
           onPress={() => setActivePage('profile')}
         >
@@ -1315,12 +897,21 @@ export default function HomeScreen() {
           accessibilityLabel="Growmies"
           style={({ pressed, hovered }) => [
             styles.bottomNavItem,
-            activePage === 'growmies' && styles.bottomNavItemActive,
-            (pressed || hovered) && styles.bottomNavItemHover,
+            themeMode === 'night' && styles.bottomNavItemNight,
+            activePage === 'growmies' && (themeMode === 'night' ? styles.bottomNavItemActiveNight : styles.bottomNavItemActive),
+            (pressed || hovered) && (themeMode === 'night' ? styles.bottomNavItemHoverNight : styles.bottomNavItemHover),
           ]}
           onPress={() => setActivePage('growmies')}
         >
-          <Text style={[styles.bottomNavText, activePage === 'growmies' && styles.bottomNavTextActive]}>Growmies</Text>
+          <Text
+            style={[
+              styles.bottomNavText,
+              themeMode === 'night' && styles.bottomNavTextNight,
+              activePage === 'growmies' && (themeMode === 'night' ? styles.bottomNavTextActiveNight : styles.bottomNavTextActive),
+            ]}
+          >
+            Growmies
+          </Text>
         </Pressable>
       </View>
     </View>
@@ -1353,21 +944,41 @@ export default function HomeScreen() {
         />
       )}
       <View style={styles.settingsMenuAnchor}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Settings"
-          style={({ pressed, hovered }) => [
-            styles.settingsFloatingButton,
-            (pressed || hovered || settingsMenuOpen) && styles.settingsFloatingButtonActive,
-          ]}
-          onPress={() => setSettingsMenuOpen((prev) => !prev)}
-        >
-          <Text style={styles.settingsFloatingButtonIcon}>⚙</Text>
-        </Pressable>
+        <View style={styles.topRightActionRow}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Toggle day night mode"
+            style={({ pressed, hovered }) => [
+              styles.themeFloatingButton,
+              themeMode === 'night' && styles.themeFloatingButtonNight,
+              (pressed || hovered) && styles.themeFloatingButtonActive,
+              themeMode === 'night' && (pressed || hovered) && styles.themeFloatingButtonActiveNight,
+            ]}
+            onPress={toggleThemeMode}
+          >
+            <Text style={[styles.themeFloatingButtonIcon, themeMode === 'night' && styles.themeFloatingButtonIconNight]}>
+              {themeMode === 'night' ? '🌙' : '☀️'}
+            </Text>
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Settings"
+            style={({ pressed, hovered }) => [
+              styles.settingsFloatingButton,
+              themeMode === 'night' && styles.settingsFloatingButtonNight,
+              (pressed || hovered || settingsMenuOpen) && styles.settingsFloatingButtonActive,
+              themeMode === 'night' && (pressed || hovered || settingsMenuOpen) && styles.settingsFloatingButtonActiveNight,
+            ]}
+            onPress={() => setSettingsMenuOpen((prev) => !prev)}
+          >
+            <Text style={[styles.settingsFloatingButtonIcon, themeMode === 'night' && styles.settingsFloatingButtonIconNight]}>⚙</Text>
+          </Pressable>
+        </View>
         <Animated.View
           pointerEvents={settingsMenuOpen ? 'auto' : 'none'}
           style={[
             styles.settingsMenuDropdown,
+            themeMode === 'night' && styles.settingsMenuDropdownNight,
             {
               opacity: settingsMenuAnim,
               transform: [
@@ -1386,7 +997,9 @@ export default function HomeScreen() {
             <TouchableOpacity
               style={[
                 styles.settingsMenuItem,
+                themeMode === 'night' && styles.settingsMenuItemNight,
                 isSettingsItemActive('profile') && styles.settingsMenuItemActive,
+                themeMode === 'night' && isSettingsItemActive('profile') && styles.settingsMenuItemActiveNight,
               ]}
               onPress={() => {
                 setSettingsMenuOpen(false);
@@ -1396,7 +1009,9 @@ export default function HomeScreen() {
               <Text
                 style={[
                   styles.settingsMenuItemText,
+                  themeMode === 'night' && styles.settingsMenuItemTextNight,
                   isSettingsItemActive('profile') && styles.settingsMenuItemTextActive,
+                  themeMode === 'night' && isSettingsItemActive('profile') && styles.settingsMenuItemTextActiveNight,
                 ]}
               >
                 Profile settings
@@ -1405,7 +1020,9 @@ export default function HomeScreen() {
             <TouchableOpacity
               style={[
                 styles.settingsMenuItem,
+                themeMode === 'night' && styles.settingsMenuItemNight,
                 isSettingsItemActive('diary') && styles.settingsMenuItemActive,
+                themeMode === 'night' && isSettingsItemActive('diary') && styles.settingsMenuItemActiveNight,
               ]}
               onPress={() => {
                 setSettingsMenuOpen(false);
@@ -1416,7 +1033,9 @@ export default function HomeScreen() {
               <Text
                 style={[
                   styles.settingsMenuItemText,
+                  themeMode === 'night' && styles.settingsMenuItemTextNight,
                   isSettingsItemActive('diary') && styles.settingsMenuItemTextActive,
+                  themeMode === 'night' && isSettingsItemActive('diary') && styles.settingsMenuItemTextActiveNight,
                 ]}
               >
                 Diaries settings
@@ -1425,14 +1044,18 @@ export default function HomeScreen() {
             <TouchableOpacity
               style={[
                 styles.settingsMenuItem,
+                themeMode === 'night' && styles.settingsMenuItemNight,
                 isSettingsItemActive('growmies') && styles.settingsMenuItemActive,
+                themeMode === 'night' && isSettingsItemActive('growmies') && styles.settingsMenuItemActiveNight,
               ]}
               onPress={() => openSettingsSection('growmies')}
             >
               <Text
                 style={[
                   styles.settingsMenuItemText,
+                  themeMode === 'night' && styles.settingsMenuItemTextNight,
                   isSettingsItemActive('growmies') && styles.settingsMenuItemTextActive,
+                  themeMode === 'night' && isSettingsItemActive('growmies') && styles.settingsMenuItemTextActiveNight,
                 ]}
               >
                 Growmies settings
@@ -1441,14 +1064,18 @@ export default function HomeScreen() {
             <TouchableOpacity
               style={[
                 styles.settingsMenuItem,
+                themeMode === 'night' && styles.settingsMenuItemNight,
                 isSettingsItemActive('relays') && styles.settingsMenuItemActive,
+                themeMode === 'night' && isSettingsItemActive('relays') && styles.settingsMenuItemActiveNight,
               ]}
               onPress={() => openSettingsSection('relays')}
             >
               <Text
                 style={[
                   styles.settingsMenuItemText,
+                  themeMode === 'night' && styles.settingsMenuItemTextNight,
                   isSettingsItemActive('relays') && styles.settingsMenuItemTextActive,
+                  themeMode === 'night' && isSettingsItemActive('relays') && styles.settingsMenuItemTextActiveNight,
                 ]}
               >
                 Relay settings
@@ -1458,14 +1085,18 @@ export default function HomeScreen() {
               style={[
                 styles.settingsMenuItem,
                 styles.settingsMenuItemLast,
+                themeMode === 'night' && styles.settingsMenuItemNight,
                 isSettingsItemActive('hashtags') && styles.settingsMenuItemActive,
+                themeMode === 'night' && isSettingsItemActive('hashtags') && styles.settingsMenuItemActiveNight,
               ]}
               onPress={() => openSettingsSection('hashtags')}
             >
               <Text
                 style={[
                   styles.settingsMenuItemText,
+                  themeMode === 'night' && styles.settingsMenuItemTextNight,
                   isSettingsItemActive('hashtags') && styles.settingsMenuItemTextActive,
+                  themeMode === 'night' && isSettingsItemActive('hashtags') && styles.settingsMenuItemTextActiveNight,
                 ]}
               >
                 Hashtag settings
@@ -1487,12 +1118,12 @@ export default function HomeScreen() {
             accessibilityRole="button"
             accessibilityLabel="Close login menu"
             onPress={() => setLoginPromptMenuOpen(false)}
-            style={styles.loginPromptBackdrop}
+            style={[styles.loginPromptBackdrop, themeMode === 'night' && styles.loginPromptBackdropNight]}
           />
         )}
         <View style={styles.loginPromptAnchor}>
           <TouchableOpacity
-            style={styles.loginPromptButton}
+            style={[styles.loginPromptButton, themeMode === 'night' && styles.loginPromptButtonNight]}
             onPress={() => setLoginPromptMenuOpen((prev) => !prev)}
             accessibilityRole="button"
             accessibilityLabel="Login"
@@ -1500,9 +1131,9 @@ export default function HomeScreen() {
             <Text style={styles.loginPromptButtonText}>Login</Text>
           </TouchableOpacity>
           {loginPromptMenuOpen && (
-            <View style={styles.loginPromptMenu}>
+            <View style={[styles.loginPromptMenu, themeMode === 'night' && styles.loginPromptMenuNight]}>
               <TouchableOpacity
-                style={styles.loginPromptMenuItem}
+                style={[styles.loginPromptMenuItem, themeMode === 'night' && styles.loginPromptMenuItemNight]}
                 onPress={() => {
                   setLoginPromptMenuOpen(false);
                   handleConnectSigner().catch((err) => {
@@ -1510,17 +1141,21 @@ export default function HomeScreen() {
                   });
                 }}
               >
-                <Text style={styles.loginPromptMenuItemText}>Login with Alby</Text>
+                <Text style={[styles.loginPromptMenuItemText, themeMode === 'night' && styles.loginPromptMenuItemTextNight]}>Login with Alby</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.loginPromptMenuItem, styles.loginPromptMenuItemLast]}
+                style={[
+                  styles.loginPromptMenuItem,
+                  styles.loginPromptMenuItemLast,
+                  themeMode === 'night' && styles.loginPromptMenuItemNight,
+                ]}
                 onPress={() => {
                   enableAnonymousBrowsing().catch(() => {
                     // best-effort persistence only
                   });
                 }}
               >
-                <Text style={styles.loginPromptMenuItemText}>Continue as anon</Text>
+                <Text style={[styles.loginPromptMenuItemText, themeMode === 'night' && styles.loginPromptMenuItemTextNight]}>Continue as anon</Text>
               </TouchableOpacity>
             </View>
           )}
@@ -1529,8 +1164,48 @@ export default function HomeScreen() {
     );
   };
 
+  const renderFloatingSessionActions = () => {
+    if (!authState.isLoggedIn) return null;
+    return (
+      <View style={styles.logoutPromptWrap} pointerEvents="box-none">
+        <View style={styles.sessionPromptAnchor}>
+          <TouchableOpacity
+            style={[styles.logoutPromptButton, themeMode === 'night' && styles.logoutPromptButtonNight]}
+            onPress={() => {
+              handleLogout().catch((err) => {
+                setError(err instanceof Error ? err.message : 'Failed to logout');
+              });
+            }}
+            accessibilityRole="button"
+            accessibilityLabel="Logout"
+          >
+            <Text style={styles.logoutPromptButtonText}>Logout</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  };
+
+  if (!loginPromptLoaded) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.bootLoadingWrap}>
+          <Image source={require('../assets/WeedoshiBanner.png')} style={styles.bootLoadingImage} resizeMode="cover" />
+          <Text style={styles.bootLoadingText}>Loading feed...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container}>
+      <View pointerEvents="none" style={styles.pageBgLayer}>
+        <Image
+          source={themeMode === 'night' ? require('../assets/nightbg.png') : require('../assets/daybg.png')}
+          style={styles.pageBgImage}
+          resizeMode="cover"
+        />
+      </View>
       {error && (
         <View style={styles.errorBoxGlobal}>
           <Text style={styles.errorText}>{error}</Text>
@@ -1544,15 +1219,16 @@ export default function HomeScreen() {
       {activePage === 'profile' && renderProfilePage()}
       {activePage === 'growmies' && renderGrowmiesPage()}
       {activePage === 'settings' && renderSettingsPage()}
+      {renderFloatingSessionActions()}
       {renderFloatingLoginPrompt()}
       {renderFloatingSettingsMenu()}
       {renderBottomNav()}
 
       <Modal visible={addToDiaryModalOpen} transparent animationType="fade" onRequestClose={() => setAddToDiaryModalOpen(false)}>
         <View style={styles.modalOverlay}>
-          <View style={styles.modalCard}>
-            <Text style={styles.panelTitle}>Add to Diary</Text>
-            <Text style={styles.statusText}>Select an existing diary or create a new one.</Text>
+          <View style={[styles.modalCard, themeMode === 'night' && styles.modalCardNight]}>
+            <Text style={[styles.panelTitle, themeMode === 'night' && styles.panelTitleNight]}>Add to Diary</Text>
+            <Text style={[styles.statusText, themeMode === 'night' && styles.statusTextNight]}>Select an existing diary or create a new one.</Text>
 
             <ScrollView style={styles.modalList}>
               {runOptions.map((run) => (
@@ -1561,10 +1237,12 @@ export default function HomeScreen() {
                   style={[
                     styles.runMenuItem,
                     addToDiaryTargetId === run.diaryId && styles.modalSelectedDiary,
+                    themeMode === 'night' && styles.runMenuItemNight,
+                    themeMode === 'night' && addToDiaryTargetId === run.diaryId && styles.modalSelectedDiaryNight,
                   ]}
                   onPress={() => setAddToDiaryTargetId(run.diaryId)}
                 >
-                  <Text style={styles.runMenuText}>
+                  <Text style={[styles.runMenuText, themeMode === 'night' && styles.runMenuTextNight]}>
                     {run.title} • {run.itemCount} items • {run.syncStatus}
                   </Text>
                 </TouchableOpacity>
@@ -1572,16 +1250,19 @@ export default function HomeScreen() {
             </ScrollView>
 
             <TextInput
-              style={styles.input}
+              style={[styles.input, themeMode === 'night' && styles.inputNight]}
               placeholder="New diary name (optional)"
-              placeholderTextColor="#999"
+              placeholderTextColor={themeMode === 'night' ? '#94a3b8' : '#999'}
               value={newDiaryInlineTitle}
               onChangeText={setNewDiaryInlineTitle}
             />
 
             <View style={styles.modalActions}>
-              <TouchableOpacity style={styles.stickySecondary} onPress={() => setAddToDiaryModalOpen(false)}>
-                <Text style={styles.stickySecondaryText}>Cancel</Text>
+              <TouchableOpacity
+                style={[styles.stickySecondary, themeMode === 'night' && styles.stickySecondaryNight]}
+                onPress={() => setAddToDiaryModalOpen(false)}
+              >
+                <Text style={[styles.stickySecondaryText, themeMode === 'night' && styles.stickySecondaryTextNight]}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={styles.stickyPrimary}
@@ -1603,1308 +1284,538 @@ export default function HomeScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#f2f1eb',
-  },
-  pageContainer: {
-    flex: 1,
-    paddingBottom: 92,
-  },
-  pageInner: {
-    width: '100%',
-    maxWidth: 1080,
-    alignSelf: 'center',
-    paddingHorizontal: 14,
-    paddingTop: 6,
-    paddingBottom: 16,
-  },
-  pageInnerMobile: {
-    paddingHorizontal: 0,
-  },
-  scrollContent: {
-    flex: 1,
-  },
-  scrollWithStickyPadding: {
-    paddingBottom: 88,
-  },
-  panel: {
-    backgroundColor: '#fffdf8',
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 14,
-    borderWidth: 1,
-    borderColor: '#e2d5b8',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.07,
-    shadowRadius: 6,
-    elevation: 2,
-  },
-  panelTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    marginBottom: 12,
-    color: '#1f2937',
-  },
-  settingsHeaderRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 8,
-    paddingHorizontal: 2,
-  },
-  feedHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  centerContent: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 32,
-  },
-  loadingText: {
-    marginTop: 12,
-    fontSize: 14,
-    color: '#6b7280',
-  },
-  emptyText: {
-    fontSize: 14,
-    color: '#9ca3af',
-  },
-  feedItem: {
-    backgroundColor: '#fffefb',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: '#e2d7c0',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.04,
-    shadowRadius: 3,
-    elevation: 1,
-  },
-  feedItemHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    marginBottom: 8,
-  },
-  feedAuthorAvatar: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#e2f0df',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  feedAuthorAvatarText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#1f5d35',
-  },
-  feedAuthorMeta: {
-    flex: 1,
-    minWidth: 0,
-  },
-  author: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#1f5d35',
-    lineHeight: 16,
-  },
-  timestamp: {
-    fontSize: 11,
-    color: '#9ca3af',
-    marginTop: 3,
-  },
-  tagsContainer: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-    marginTop: 6,
-  },
-  tag: {
-    fontSize: 12,
-    color: '#1f5d35',
-    fontWeight: '600',
-    backgroundColor: '#ecf2e6',
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-  },
-  profileHeaderCard: {
-    backgroundColor: '#fffdf8',
-    borderRadius: 14,
-    paddingBottom: 14,
-    marginBottom: 8,
-    marginTop: 4,
-    borderWidth: 1,
-    borderColor: '#e1d1ae',
-    overflow: 'hidden',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.08,
-    shadowRadius: 18,
-    elevation: 3,
-  },
-  profileHeaderCardMobile: {
-    marginTop: 6,
-    borderRadius: 12,
-  },
-  profileHeaderCardEditing: {
-    overflow: 'visible',
-  },
-  profileBannerWrap: {
-    width: '100%',
-    height: 244,
-    overflow: 'hidden',
-    borderTopLeftRadius: 14,
-    borderTopRightRadius: 14,
-  },
-  profileBannerWrapMobile: {
-    height: 192,
-  },
-  profileBannerImage: {
-    width: '100%',
-    height: '100%',
-    backgroundColor: '#d1d5db',
-  },
-  profileBannerOverlayTop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.22)',
-  },
-  profileBannerOverlayBottom: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    height: '60%',
-    backgroundColor: 'rgba(0,0,0,0.42)',
-  },
-  profileHeaderContent: {
-    marginTop: -36,
-    paddingHorizontal: 18,
-    paddingTop: 0,
-  },
-  profileHeaderContentMobile: {
-    marginTop: -24,
-    paddingHorizontal: 12,
-  },
-  brandPlaqueInline: {
-    alignSelf: 'flex-start',
-    marginLeft: 2,
-    marginBottom: 4,
-    borderRadius: 16,
-    overflow: 'hidden',
-  },
-  brandPlaqueInlineMobile: {
-    marginLeft: 8,
-  },
-  brandPlaqueImage: {
-    width: 286,
-    height: 124,
-    borderRadius: 16,
-    opacity: 0.9,
-  },
-  profileHeaderRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 14,
-    marginBottom: 14,
-  },
-  profileHeaderRowMobile: {
-    gap: 10,
-    marginBottom: 12,
-  },
-  avatarCircle: {
-    width: 96,
-    height: 96,
-    borderRadius: 48,
-    backgroundColor: '#d1fae5',
-    alignItems: 'center',
-    justifyContent: 'center',
-    overflow: 'hidden',
-    borderWidth: 4,
-    borderColor: '#fffef9',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.22,
-    shadowRadius: 14,
-    elevation: 8,
-  },
-  avatarCircleMobile: {
-    width: 78,
-    height: 78,
-    borderRadius: 39,
-  },
-  avatarLabel: {
-    fontSize: 24,
-    fontWeight: '700',
-    color: '#047857',
-  },
-  avatarImage: {
-    width: 96,
-    height: 96,
-    borderRadius: 48,
-  },
-  avatarImageMobile: {
-    width: 78,
-    height: 78,
-    borderRadius: 39,
-  },
-  profileMeta: {
-    flex: 1,
-    paddingTop: 10,
-    backgroundColor: '#fffdf7',
-    borderWidth: 1,
-    borderColor: '#dfcfa9',
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingBottom: 10,
-  },
-  profileNameRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 10,
-  },
-  profileName: {
-    fontSize: 38,
-    fontWeight: '700',
-    color: '#1b4d2f',
-    flexShrink: 1,
-  },
-  profileNameMobile: {
-    fontSize: 30,
-  },
-  profilePubkey: {
-    fontSize: 11,
-    color: '#947848',
-    opacity: 0.9,
-    marginTop: 4,
-    fontFamily: 'monospace',
-    flexShrink: 1,
-  },
-  profileBio: {
-    fontSize: 16,
-    lineHeight: 26,
-    color: '#304335',
-    marginTop: 14,
-  },
-  profileStatsRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 12,
-    alignItems: 'center',
-  },
-  profileQuickActions: {
-    marginTop: 10,
-    alignItems: 'flex-start',
-  },
-  profileStatPill: {
-    borderWidth: 1,
-    borderColor: '#d7be86',
-    backgroundColor: '#fbf7ee',
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    minWidth: 88,
-  },
-  profileStatValue: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: '#2a6a3c',
-  },
-  profileStatLabel: {
-    fontSize: 10,
-    fontWeight: '600',
-    color: '#967a47',
-    marginTop: 2,
-  },
-  profileStatActionPill: {
-    borderWidth: 1,
-    borderColor: '#7cb08a',
-    backgroundColor: '#2e7044',
-    borderRadius: 999,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    minWidth: 88,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  profileStatActionPillDisabled: {
-    opacity: 0.6,
-  },
-  profileStatActionText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#f5fff8',
-  },
-  diaryHeaderActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingHorizontal: 16,
-    justifyContent: 'flex-end',
-    marginBottom: 8,
-  },
-  runSelectorRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    marginBottom: 10,
-    paddingHorizontal: 16,
-  },
-  runSelectorButton: {
-    borderWidth: 1,
-    borderColor: '#d1d5db',
-    borderRadius: 8,
-    paddingHorizontal: 11,
-    paddingVertical: 8,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#fff',
-    minWidth: 220,
-    maxWidth: 360,
-  },
-  runSelectorText: {
-    fontSize: 13,
-    fontWeight: '500',
-    color: '#1f2937',
-  },
-  runSelectorChevron: {
-    fontSize: 10,
-    color: '#6b7280',
-  },
-  runMenu: {
-    marginTop: 2,
-    marginHorizontal: 16,
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
-    borderRadius: 8,
-    overflow: 'hidden',
-    backgroundColor: '#fff',
-  },
-  runMenuItem: {
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
-    gap: 8,
-  },
-  runMenuSelectBtn: {
-    width: '100%',
-  },
-  runMenuActions: {
-    flexDirection: 'row',
-    gap: 8,
-    alignItems: 'center',
-  },
-  runActionButton: {
-    borderWidth: 1,
-    borderColor: '#d1d5db',
-    borderRadius: 6,
-    backgroundColor: '#fff',
-    paddingHorizontal: 8,
-    paddingVertical: 5,
-  },
-  runActionButtonDanger: {
-    borderColor: '#fca5a5',
-    backgroundColor: '#fff1f2',
-  },
-  runActionButtonText: {
-    fontSize: 11,
-    color: '#374151',
-    fontWeight: '700',
-  },
-  runActionButtonDangerText: {
-    color: '#b91c1c',
-  },
-  runMenuText: {
-    fontSize: 13,
-    color: '#1f2937',
-  },
-  syncBadgeRow: {
-    paddingHorizontal: 16,
-    marginBottom: 8,
-  },
-  syncBadgeText: {
-    fontSize: 12,
-    color: '#0f766e',
-    fontWeight: '600',
-  },
-  ghostButton: {
-    borderWidth: 1,
-    borderColor: '#d1d5db',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    backgroundColor: '#fff',
-  },
-  ghostButtonText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#4b5563',
-  },
-  diaryDetailsWrap: {
-    paddingHorizontal: 16,
-    marginBottom: 10,
-  },
-  diaryDetailRow: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  diaryDetailField: {
-    marginBottom: 8,
-    flex: 1,
-  },
-  diaryDetailFieldHalf: {
-    minWidth: 0,
-  },
-  plantPickerLayer: {
-    zIndex: 50,
-    elevation: 3,
-  },
-  diaryDetailLabel: {
-    fontSize: 12,
-    color: '#4b5563',
-    fontWeight: '600',
-    marginBottom: 5,
-  },
-  diaryDetailInput: {
-    borderWidth: 1,
-    borderColor: '#d1d5db',
-    borderRadius: 8,
-    backgroundColor: '#fff',
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    fontSize: 13,
-    color: '#111827',
-  },
-  plantActionsRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 7,
-    alignItems: 'center',
-    flexWrap: 'wrap',
-  },
-  plantMoreWrap: {
-    marginTop: 8,
-    gap: 6,
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
-    borderRadius: 8,
-    padding: 8,
-    backgroundColor: '#f9fafb',
-  },
-  phaseTemplatesRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-    marginTop: 7,
-  },
-  phaseTemplateChip: {
-    paddingHorizontal: 9,
-    paddingVertical: 5,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#bbf7d0',
-    backgroundColor: '#f0fdf4',
-  },
-  phaseTemplateChipActive: {
-    borderColor: '#16a34a',
-    backgroundColor: '#dcfce7',
-  },
-  phaseTemplateChipText: {
-    fontSize: 11,
-    color: '#166534',
-    fontWeight: '600',
-  },
-  phaseTemplateChipTextActive: {
-    color: '#14532d',
-  },
-  profileTabs: {
-    flexDirection: 'row',
-    borderBottomWidth: 1,
-    borderBottomColor: '#e5e7eb',
-    marginTop: 10,
-    marginBottom: 4,
-    paddingHorizontal: 0,
-    gap: 8,
-  },
-  profileTab: {
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    marginRight: 0,
-  },
-  profileTabActive: {
-    backgroundColor: '#edf2e8',
-  },
-  profileTabHover: {
-    backgroundColor: '#f3f4f6',
-  },
-  profileTabText: {
-    fontSize: 14,
-    color: '#6b7280',
-    fontWeight: '500',
-  },
-  profileTabTextActive: {
-    color: '#235a37',
-    fontWeight: '600',
-  },
-  profileTabUnderline: {
-    marginTop: 8,
-    height: 2,
-    borderRadius: 2,
-    backgroundColor: 'transparent',
-  },
-  profileTabUnderlineActive: {
-    backgroundColor: '#b38a3f',
-  },
-  emptyDiaryState: {
-    backgroundColor: '#fffdf9',
-    borderRadius: 12,
-    padding: 24,
-    alignItems: 'center',
-    marginBottom: 14,
-    borderWidth: 1,
-    borderColor: '#e2d6be',
-  },
-  emptyDiaryTitle: {
-    fontSize: 22,
-    fontWeight: '700',
-    color: '#111827',
-    textAlign: 'center',
-  },
-  emptyDiarySubtitle: {
-    marginTop: 10,
-    fontSize: 14,
-    color: '#6b7280',
-    textAlign: 'center',
-    marginBottom: 18,
-    lineHeight: 20,
-  },
-  diaryCard: {
-    backgroundColor: '#fffefb',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 9,
-    borderWidth: 1,
-    borderColor: '#e2d7c2',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 3,
-    elevation: 1,
-  },
-  diaryTilesGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 12,
-    marginBottom: 14,
-  },
-  diaryTileCard: {
-    backgroundColor: '#fffefb',
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#e1d5bc',
-    overflow: 'hidden',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 5,
-    elevation: 2,
-  },
-  diaryTileCardDesktop: {
-    width: '32.5%',
-  },
-  diaryTileCardMobile: {
-    width: '48.5%',
-  },
-  diaryTileCardHover: {
-    borderColor: '#86efac',
-    shadowOpacity: 0.12,
-    shadowRadius: 9,
-    elevation: 3,
-    transform: [{ translateY: -1 }],
-  },
-  diaryTileImageWrap: {
-    position: 'relative',
-  },
-  diaryTileImage: {
-    width: '100%',
-    height: 190,
-    backgroundColor: '#1f2e22',
-  },
-  diaryTileImageShade: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    height: 62,
-    backgroundColor: 'rgba(0,0,0,0.18)',
-  },
-  diaryTileCoverBadge: {
-    position: 'absolute',
-    top: 8,
-    left: 8,
-    borderRadius: 999,
-    backgroundColor: 'rgba(5,150,105,0.92)',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  diaryTileCoverBadgeText: {
-    fontSize: 10,
-    color: '#ffffff',
-    fontWeight: '700',
-  },
-  diaryTileImageFallback: {
-    width: '100%',
-    height: 190,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#f3f4f6',
-  },
-  diaryTileImageFallbackText: {
-    fontSize: 11,
-    color: '#6b7280',
-    fontWeight: '600',
-  },
-  diaryTileMeta: {
-    paddingHorizontal: 12,
-    paddingVertical: 11,
-  },
-  diaryTileTitle: {
-    fontSize: 14,
-    color: '#111827',
-    fontWeight: '700',
-  },
-  diaryTileSub: {
-    marginTop: 3,
-    fontSize: 12,
-    color: '#2b6a3c',
-    fontWeight: '600',
-  },
-  diaryTileDate: {
-    marginTop: 5,
-    fontSize: 11,
-    color: '#6b7280',
-  },
-  stickyBar: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 76,
-    alignItems: 'center',
-  },
-  stickyBarInner: {
-    width: '100%',
-    maxWidth: 860,
-    backgroundColor: '#fff',
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
-    padding: 8,
-    flexDirection: 'row',
-    gap: 10,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.09,
-    shadowRadius: 4,
-    elevation: 3,
-  },
-  stickyBarInnerMobile: {
-    marginHorizontal: 12,
-  },
-  stickySecondary: {
-    flex: 1,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#d1d5db',
-    paddingVertical: 12,
-    alignItems: 'center',
-    backgroundColor: '#fff',
-  },
-  stickySecondaryText: {
-    color: '#374151',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  stickyPrimary: {
-    flex: 1,
-    borderRadius: 8,
-    backgroundColor: '#059669',
-    paddingVertical: 12,
-    alignItems: 'center',
-  },
-  tabContainer: {
-    flexDirection: 'row',
-    marginBottom: 12,
-    borderRadius: 6,
-    backgroundColor: '#f3f4f6',
-    padding: 2,
-  },
-  tab: {
-    flex: 1,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 5,
-    alignItems: 'center',
-  },
-  activeTab: {
-    backgroundColor: '#059669',
-  },
-  tabText: {
-    fontSize: 13,
-    fontWeight: '500',
-    color: '#6b7280',
-  },
-  activeTabText: {
-    color: '#fff',
-  },
-  input: {
-    borderWidth: 1,
-    borderColor: '#dacdb3',
-    borderRadius: 6,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 14,
-    marginBottom: 12,
-    color: '#1f2937',
-  },
-  flexInput: {
-    flex: 1,
-  },
-  inputGroup: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  button: {
-    backgroundColor: '#2f6b3f',
-    borderRadius: 6,
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    alignItems: 'center',
-  },
-  smallButton: {
-    backgroundColor: '#2f6b3f',
-    borderRadius: 8,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    alignItems: 'center',
-  },
-  buttonSecondary: {
-    backgroundColor: '#2f6b3f',
-    borderRadius: 6,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    alignItems: 'center',
-    marginTop: 10,
-    alignSelf: 'flex-start',
-  },
-  addToDiaryMini: {
-    marginTop: 9,
-    alignSelf: 'flex-start',
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#d5bf8f',
-    backgroundColor: '#f7f2e7',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-  },
-  addToDiaryMiniText: {
-    color: '#2f6b3f',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  relayItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 8,
-    paddingHorizontal: 8,
-    borderRadius: 6,
-    backgroundColor: '#f9fafb',
-    marginBottom: 8,
-  },
-  checkbox: {
-    width: 24,
-    height: 24,
-    borderWidth: 2,
-    borderColor: '#2f6b3f',
-    borderRadius: 4,
-    marginRight: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  checkmark: {
-    color: '#2f6b3f',
-    fontSize: 16,
-    fontWeight: 'bold',
-  },
-  relayUrl: {
-    flex: 1,
-    fontSize: 12,
-    color: '#6b7280',
-    fontFamily: 'monospace',
-  },
-  removeBtn: {
-    color: '#ef4444',
-    fontSize: 18,
-    fontWeight: 'bold',
-    marginLeft: 8,
-  },
-  hashtagContainer: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginBottom: 12,
-  },
-  hashtagBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#ebf2e5',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 20,
-    gap: 6,
-  },
-  hashtagText: {
-    fontSize: 13,
-    color: '#2f6b3f',
-    fontWeight: '500',
-  },
-  errorBoxGlobal: {
-    backgroundColor: '#fee2e2',
-    borderRadius: 8,
-    padding: 12,
-    marginHorizontal: 16,
-    marginTop: 10,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  errorText: {
-    color: '#991b1b',
-    fontSize: 13,
-    flex: 1,
-  },
-  errorDismiss: {
-    color: '#991b1b',
-    fontSize: 18,
-    fontWeight: 'bold',
-    marginLeft: 8,
-  },
-  infoBox: {
-    backgroundColor: '#eff6ff',
-    borderRadius: 8,
-    padding: 12,
-    marginBottom: 12,
-  },
-  infoText: {
-    color: '#1e3a8a',
-    fontSize: 12,
-  },
-  statusText: {
-    fontSize: 14,
-    color: '#6b7280',
-    marginBottom: 8,
-  },
-  pubkeyText: {
-    fontSize: 12,
-    color: '#9ca3af',
-    fontFamily: 'monospace',
-    marginBottom: 12,
-  },
-  signerHint: {
-    fontSize: 12,
-    color: '#6b7280',
-    marginBottom: 10,
-  },
-  feedFilterCard: {
-    borderWidth: 1,
-    borderColor: '#d9c89e',
-    borderRadius: 10,
-    backgroundColor: '#f8f4eb',
-    padding: 10,
-    marginBottom: 12,
-  },
-  feedSearchRow: {
-    gap: 8,
-    marginBottom: 10,
-  },
-  searchSuggestionRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-  },
-  searchSuggestionChip: {
-    borderWidth: 1,
-    borderColor: '#cde1d3',
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    backgroundColor: '#eff8f2',
-  },
-  searchSuggestionText: {
-    fontSize: 11,
-    color: '#1f5d35',
-    fontWeight: '600',
-  },
-  feedFilterHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 8,
-    marginBottom: 8,
-  },
-  feedFilterTitle: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: '#2f6b3f',
-  },
-  filterToggleBtn: {
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#2f6b3f',
-    backgroundColor: '#e4efdf',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-  },
-  filterToggleBtnMuted: {
-    borderColor: '#d1d5db',
-    backgroundColor: '#f3f4f6',
-  },
-  filterToggleBtnText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: '#2f6b3f',
-  },
-  readOnlyGuardHint: {
-    fontSize: 12,
-    color: '#b45309',
-    marginTop: 8,
-  },
-  nip46StatusRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 10,
-    gap: 8,
-  },
-  nip46PairingCard: {
-    backgroundColor: '#f8fafc',
-    borderWidth: 1,
-    borderColor: '#dbeafe',
-    borderRadius: 8,
-    padding: 10,
-    marginBottom: 12,
-  },
-  nip46PairingTitle: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: '#1e3a8a',
-    marginBottom: 6,
-  },
-  nip46PairingActions: {
-    flexDirection: 'row',
-    gap: 8,
-    alignItems: 'center',
-    marginBottom: 8,
-    flexWrap: 'wrap',
-  },
-  nip46PairingMono: {
-    fontSize: 11,
-    color: '#334155',
-    fontFamily: 'monospace',
-    marginBottom: 6,
-  },
-  webModeBanner: {
-    backgroundColor: '#ecfeff',
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#06b6d4',
-    padding: 12,
-    marginBottom: 16,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 12,
-  },
-  webModeBannerTextWrap: {
-    flex: 1,
-  },
-  webModeBannerTitle: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#0e7490',
-  },
-  webModeBannerSubtitle: {
-    fontSize: 12,
-    marginTop: 4,
-    color: '#155e75',
-  },
-  webModeOpenAppButton: {
-    backgroundColor: '#0e7490',
-    borderRadius: 6,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    alignItems: 'center',
-  },
-  bottomNavWrap: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-  },
-  bottomNav: {
-    width: '100%',
-    minHeight: 56,
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 10,
-    backgroundColor: '#fffdf8',
-    borderTopWidth: 1,
-    borderTopColor: '#dfcfad',
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 12,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: -2 },
-    shadowOpacity: 0.08,
-    shadowRadius: 10,
-    elevation: 10,
-  },
-  bottomNavItem: {
-    minHeight: 40,
-    paddingHorizontal: 14,
-    borderRadius: 999,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: 'transparent',
-  },
-  bottomNavItemActive: {
-    backgroundColor: '#edf2e8',
-    borderColor: '#d9c593',
-  },
-  bottomNavItemHover: {
-    backgroundColor: '#f3f4f6',
-  },
-  bottomNavText: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#6b7280',
-  },
-  bottomNavTextActive: {
-    color: '#2f6b3f',
-  },
-  bottomNavProfileItem: {
-    width: 74,
-    height: 74,
-    borderRadius: 37,
-    marginTop: -30,
-    borderWidth: 2,
-    borderColor: '#ffffff',
-    backgroundColor: '#ffffff',
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#7cff9e',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.35,
-    shadowRadius: 14,
-    elevation: 9,
-  },
-  bottomNavProfileItemActive: {
-    borderColor: '#7cff9e',
-    backgroundColor: '#f6f1e5',
-    shadowColor: '#7cff9e',
-    shadowOpacity: 0.55,
-    shadowRadius: 20,
-    elevation: 12,
-  },
-  bottomNavProfileItemHover: {
-    backgroundColor: '#f3f4f6',
-  },
-  bottomNavProfileImage: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-  },
-  bottomNavProfileFallback: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    backgroundColor: '#d1fae5',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  bottomNavProfileText: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#047857',
-  },
-  settingsMenuWrap: {
-    ...StyleSheet.absoluteFillObject,
-    zIndex: 40,
-  },
-  settingsMenuBackdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(17,24,39,0.14)',
-  },
-  settingsMenuAnchor: {
-    position: 'absolute',
-    top: 12,
-    right: 12,
-    alignItems: 'flex-end',
-  },
-  settingsFloatingButton: {
-    width: 46,
-    height: 46,
-    borderRadius: 23,
-    borderWidth: 1,
-    borderColor: '#d1d5db',
-    backgroundColor: '#ffffff',
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.12,
-    shadowRadius: 10,
-    elevation: 6,
-  },
-  settingsFloatingButtonActive: {
-    backgroundColor: '#f3f4f6',
-  },
-  settingsFloatingButtonIcon: {
-    fontSize: 20,
-    color: '#374151',
-  },
-  settingsMenuDropdown: {
-    marginTop: 8,
-    minWidth: 210,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
-    backgroundColor: '#ffffff',
-    overflow: 'hidden',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.14,
-    shadowRadius: 18,
-    elevation: 10,
-  },
-  settingsMenuItem: {
-    paddingVertical: 11,
-    paddingHorizontal: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
-  },
-  settingsMenuItemLast: {
-    borderBottomWidth: 0,
-  },
-  settingsMenuItemActive: {
-    backgroundColor: '#ecfdf5',
-  },
-  settingsMenuItemText: {
-    fontSize: 14,
-    color: '#1f2937',
-    fontWeight: '600',
-  },
-  settingsMenuItemTextActive: {
-    color: '#047857',
-  },
-  loginPromptWrap: {
-    ...StyleSheet.absoluteFillObject,
-    zIndex: 41,
-  },
-  loginPromptBackdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(17,24,39,0.08)',
-  },
-  loginPromptAnchor: {
-    position: 'absolute',
-    top: 12,
-    left: 12,
-    alignItems: 'flex-start',
-  },
-  loginPromptButton: {
-    borderRadius: 999,
-    backgroundColor: '#16a34a',
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.14,
-    shadowRadius: 10,
-    elevation: 6,
-  },
-  loginPromptButtonText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  loginPromptMenu: {
-    marginTop: 8,
-    minWidth: 190,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#dcfce7',
-    backgroundColor: '#ffffff',
-    overflow: 'hidden',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.12,
-    shadowRadius: 16,
-    elevation: 8,
-  },
-  loginPromptMenuItem: {
-    paddingVertical: 11,
-    paddingHorizontal: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f0fdf4',
-  },
-  loginPromptMenuItemLast: {
-    borderBottomWidth: 0,
-  },
-  loginPromptMenuItemText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#166534',
-  },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(17,24,39,0.5)',
-    justifyContent: 'center',
-    paddingHorizontal: 16,
-  },
-  modalCard: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    padding: 16,
-    maxHeight: '80%',
-  },
-  modalList: {
-    maxHeight: 220,
-    marginBottom: 10,
-  },
-  modalSelectedDiary: {
-    backgroundColor: '#ecfdf5',
-  },
-  modalActions: {
-    flexDirection: 'row',
-    gap: 10,
-  },
+    container: {
+        flex: 1,
+        backgroundColor: 'transparent',
+    },
+    bootLoadingWrap: {
+        flex: 1,
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: '#f4f0e6',
+        paddingHorizontal: 20,
+        gap: 14,
+    },
+    bootLoadingImage: {
+        width: '100%',
+        maxWidth: 720,
+        height: 180,
+        borderRadius: 16,
+    },
+    bootLoadingText: {
+        fontSize: 14,
+        fontWeight: '600',
+        color: '#355b2f',
+    },
+    pageBgLayer: {
+        ...StyleSheet.absoluteFillObject,
+    },
+    pageBgImage: {
+        width: '100%',
+        height: '100%',
+    },
+    panelTitle: {
+        fontSize: 16,
+        fontWeight: '600',
+        marginBottom: 12,
+        color: '#1f2937',
+    },
+    panelTitleNight: {
+        color: '#e5e7eb',
+    },
+    runMenuItem: {
+        paddingVertical: 10,
+        paddingHorizontal: 12,
+        borderBottomWidth: 1,
+        borderBottomColor: '#f3f4f6',
+        gap: 8,
+    },
+    runMenuItemNight: {
+        borderBottomColor: '#1f2937',
+    },
+    runMenuText: {
+        fontSize: 13,
+        color: '#1f2937',
+    },
+    runMenuTextNight: {
+        color: '#e2e8f0',
+    },
+    stickySecondary: {
+        flex: 1,
+        borderRadius: 8,
+        borderWidth: 1,
+        borderColor: '#d1d5db',
+        paddingVertical: 12,
+        alignItems: 'center',
+        backgroundColor: '#fff',
+    },
+    stickySecondaryText: {
+        color: '#374151',
+        fontSize: 14,
+        fontWeight: '600',
+    },
+    stickySecondaryNight: {
+        borderColor: '#475569',
+        backgroundColor: '#0f172a',
+    },
+    stickySecondaryTextNight: {
+        color: '#e2e8f0',
+    },
+    stickyPrimary: {
+        flex: 1,
+        borderRadius: 8,
+        backgroundColor: '#059669',
+        paddingVertical: 12,
+        alignItems: 'center',
+    },
+    input: {
+        borderWidth: 1,
+        borderColor: '#dacdb3',
+        borderRadius: 6,
+        paddingHorizontal: 12,
+        paddingVertical: 10,
+        fontSize: 14,
+        marginBottom: 12,
+        color: '#1f2937',
+    },
+    inputNight: {
+        borderColor: '#475569',
+        backgroundColor: 'rgba(15,23,42,0.82)',
+        color: '#e5e7eb',
+    },
+    buttonText: {
+        color: '#fff',
+        fontSize: 14,
+        fontWeight: '600',
+    },
+    errorBoxGlobal: {
+        backgroundColor: '#fee2e2',
+        borderRadius: 8,
+        padding: 12,
+        marginHorizontal: 16,
+        marginTop: 10,
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+    },
+    errorText: {
+        color: '#991b1b',
+        fontSize: 13,
+        flex: 1,
+    },
+    errorDismiss: {
+        color: '#991b1b',
+        fontSize: 18,
+        fontWeight: 'bold',
+        marginLeft: 8,
+    },
+    statusText: {
+        fontSize: 14,
+        color: '#6b7280',
+        marginBottom: 8,
+    },
+    statusTextNight: {
+        color: '#cbd5e1',
+    },
+    bottomNavWrap: {
+        position: 'absolute',
+        left: 0,
+        right: 0,
+        bottom: 0,
+    },
+    bottomNav: {
+        width: '100%',
+        minHeight: 56,
+        paddingHorizontal: 16,
+        paddingTop: 8,
+        paddingBottom: 10,
+        backgroundColor: '#fffdf8',
+        borderTopWidth: 1,
+        borderTopColor: '#dfcfad',
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 12,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: -2 },
+        shadowOpacity: 0.08,
+        shadowRadius: 10,
+        elevation: 10,
+    },
+    bottomNavNight: {
+        backgroundColor: 'rgba(2,6,23,0.9)',
+        borderTopColor: 'rgba(71,85,105,0.9)',
+    },
+    bottomNavItem: {
+        minHeight: 40,
+        paddingHorizontal: 14,
+        borderRadius: 999,
+        alignItems: 'center',
+        justifyContent: 'center',
+        borderWidth: 1,
+        borderColor: 'transparent',
+    },
+    bottomNavItemNight: {
+        borderColor: 'transparent',
+    },
+    bottomNavItemActive: {
+        backgroundColor: '#edf2e8',
+        borderColor: '#d9c593',
+    },
+    bottomNavItemActiveNight: {
+        backgroundColor: '#0f172a',
+        borderColor: '#475569',
+    },
+    bottomNavItemHover: {
+        backgroundColor: '#f3f4f6',
+    },
+    bottomNavItemHoverNight: {
+        backgroundColor: 'rgba(30,41,59,0.86)',
+    },
+    bottomNavText: {
+        fontSize: 13,
+        fontWeight: '600',
+        color: '#6b7280',
+    },
+    bottomNavTextNight: {
+        color: '#cbd5e1',
+    },
+    bottomNavTextActive: {
+        color: '#2f6b3f',
+    },
+    bottomNavTextActiveNight: {
+        color: '#86efac',
+    },
+    bottomNavProfileItem: {
+        width: 74,
+        height: 74,
+        borderRadius: 37,
+        marginTop: -30,
+        borderWidth: 2,
+        borderColor: '#ffffff',
+        backgroundColor: '#ffffff',
+        alignItems: 'center',
+        justifyContent: 'center',
+        shadowColor: '#7cff9e',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.35,
+        shadowRadius: 14,
+        elevation: 9,
+    },
+    bottomNavProfileItemNight: {
+        borderColor: '#0f172a',
+        backgroundColor: '#0b1220',
+    },
+    bottomNavProfileItemActive: {
+        borderColor: '#7cff9e',
+        backgroundColor: '#f6f1e5',
+        shadowColor: '#7cff9e',
+        shadowOpacity: 0.55,
+        shadowRadius: 20,
+        elevation: 12,
+    },
+    bottomNavProfileItemActiveNight: {
+        borderColor: '#86efac',
+        backgroundColor: '#0f172a',
+        shadowColor: '#86efac',
+        shadowOpacity: 0.5,
+        shadowRadius: 18,
+        elevation: 11,
+    },
+    bottomNavProfileItemHover: {
+        backgroundColor: '#f3f4f6',
+    },
+    bottomNavProfileItemHoverNight: {
+        backgroundColor: '#111827',
+    },
+    bottomNavProfileImage: {
+        width: 64,
+        height: 64,
+        borderRadius: 32,
+    },
+    bottomNavProfileFallback: {
+        width: 64,
+        height: 64,
+        borderRadius: 32,
+        backgroundColor: '#d1fae5',
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    bottomNavProfileText: {
+        fontSize: 16,
+        fontWeight: '700',
+        color: '#047857',
+    },
+    settingsMenuWrap: {
+        ...StyleSheet.absoluteFillObject,
+        zIndex: 40,
+    },
+    settingsMenuBackdrop: {
+        ...StyleSheet.absoluteFillObject,
+        backgroundColor: 'rgba(17,24,39,0.14)',
+    },
+    settingsMenuAnchor: {
+        position: 'absolute',
+        top: 12,
+        right: 12,
+        alignItems: 'flex-end',
+    },
+    topRightActionRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 8,
+    },
+    themeFloatingButton: {
+        width: 46,
+        height: 46,
+        borderRadius: 23,
+        borderWidth: 1,
+        borderColor: '#d1d5db',
+        backgroundColor: '#ffffff',
+        alignItems: 'center',
+        justifyContent: 'center',
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.12,
+        shadowRadius: 10,
+        elevation: 6,
+    },
+    themeFloatingButtonActive: {
+        backgroundColor: '#f3f4f6',
+    },
+    themeFloatingButtonNight: {
+        borderColor: '#475569',
+        backgroundColor: 'rgba(2,6,23,0.95)',
+    },
+    themeFloatingButtonActiveNight: {
+        backgroundColor: '#0f172a',
+    },
+    themeFloatingButtonIcon: {
+        fontSize: 18,
+        color: '#374151',
+    },
+    themeFloatingButtonIconNight: {
+        color: '#f8fafc',
+    },
+    settingsFloatingButton: {
+        width: 46,
+        height: 46,
+        borderRadius: 23,
+        borderWidth: 1,
+        borderColor: '#d1d5db',
+        backgroundColor: '#ffffff',
+        alignItems: 'center',
+        justifyContent: 'center',
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.12,
+        shadowRadius: 10,
+        elevation: 6,
+    },
+    settingsFloatingButtonActive: {
+        backgroundColor: '#f3f4f6',
+    },
+    settingsFloatingButtonNight: {
+        borderColor: '#475569',
+        backgroundColor: 'rgba(2,6,23,0.95)',
+    },
+    settingsFloatingButtonActiveNight: {
+        backgroundColor: '#0f172a',
+    },
+    settingsFloatingButtonIcon: {
+        fontSize: 20,
+        color: '#374151',
+    },
+    settingsFloatingButtonIconNight: {
+        color: '#f8fafc',
+    },
+    settingsMenuDropdown: {
+        marginTop: 8,
+        minWidth: 210,
+        borderRadius: 12,
+        borderWidth: 1,
+        borderColor: '#e5e7eb',
+        backgroundColor: '#ffffff',
+        overflow: 'hidden',
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 8 },
+        shadowOpacity: 0.14,
+        shadowRadius: 18,
+        elevation: 10,
+    },
+    settingsMenuDropdownNight: {
+        borderColor: '#334155',
+        backgroundColor: 'rgba(2,6,23,0.96)',
+    },
+    settingsMenuItem: {
+        paddingVertical: 11,
+        paddingHorizontal: 14,
+        borderBottomWidth: 1,
+        borderBottomColor: '#f3f4f6',
+    },
+    settingsMenuItemNight: {
+        borderBottomColor: '#1f2937',
+    },
+    settingsMenuItemLast: {
+        borderBottomWidth: 0,
+    },
+    settingsMenuItemActive: {
+        backgroundColor: '#ecfdf5',
+    },
+    settingsMenuItemActiveNight: {
+        backgroundColor: '#0f172a',
+    },
+    settingsMenuItemText: {
+        fontSize: 14,
+        color: '#1f2937',
+        fontWeight: '600',
+    },
+    settingsMenuItemTextNight: {
+        color: '#e2e8f0',
+    },
+    settingsMenuItemTextActive: {
+        color: '#047857',
+    },
+    settingsMenuItemTextActiveNight: {
+        color: '#86efac',
+    },
+    loginPromptWrap: {
+        ...StyleSheet.absoluteFillObject,
+        zIndex: 41,
+    },
+    logoutPromptWrap: {
+        ...StyleSheet.absoluteFillObject,
+        zIndex: 41,
+    },
+    sessionPromptAnchor: {
+        position: 'absolute',
+        top: 12,
+        left: 12,
+        alignItems: 'flex-start',
+    },
+    logoutPromptButton: {
+        borderRadius: 999,
+        backgroundColor: '#4b5563',
+        paddingVertical: 10,
+        paddingHorizontal: 16,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.14,
+        shadowRadius: 10,
+        elevation: 6,
+    },
+    logoutPromptButtonNight: {
+        backgroundColor: '#1f2937',
+        borderWidth: 1,
+        borderColor: '#475569',
+    },
+    logoutPromptButtonText: {
+        color: '#ffffff',
+        fontSize: 14,
+        fontWeight: '700',
+    },
+    loginPromptBackdrop: {
+        ...StyleSheet.absoluteFillObject,
+        backgroundColor: 'rgba(17,24,39,0.08)',
+    },
+    loginPromptBackdropNight: {
+        backgroundColor: 'rgba(2,6,23,0.32)',
+    },
+    loginPromptAnchor: {
+        position: 'absolute',
+        top: 12,
+        left: 12,
+        alignItems: 'flex-start',
+    },
+    loginPromptButton: {
+        borderRadius: 999,
+        backgroundColor: '#16a34a',
+        paddingVertical: 10,
+        paddingHorizontal: 16,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.14,
+        shadowRadius: 10,
+        elevation: 6,
+    },
+    loginPromptButtonNight: {
+        backgroundColor: '#166534',
+        borderWidth: 1,
+        borderColor: '#22c55e',
+    },
+    loginPromptButtonText: {
+        color: '#ffffff',
+        fontSize: 14,
+        fontWeight: '700',
+    },
+    loginPromptMenu: {
+        marginTop: 8,
+        minWidth: 190,
+        borderRadius: 12,
+        borderWidth: 1,
+        borderColor: '#dcfce7',
+        backgroundColor: '#ffffff',
+        overflow: 'hidden',
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 8 },
+        shadowOpacity: 0.12,
+        shadowRadius: 16,
+        elevation: 8,
+    },
+    loginPromptMenuNight: {
+        borderColor: '#334155',
+        backgroundColor: 'rgba(2,6,23,0.96)',
+    },
+    loginPromptMenuItem: {
+        paddingVertical: 11,
+        paddingHorizontal: 14,
+        borderBottomWidth: 1,
+        borderBottomColor: '#f0fdf4',
+    },
+    loginPromptMenuItemNight: {
+        borderBottomColor: '#1f2937',
+    },
+    loginPromptMenuItemLast: {
+        borderBottomWidth: 0,
+    },
+    loginPromptMenuItemText: {
+        fontSize: 14,
+        fontWeight: '600',
+        color: '#166534',
+    },
+    loginPromptMenuItemTextNight: {
+        color: '#d1fae5',
+    },
+    modalOverlay: {
+        flex: 1,
+        backgroundColor: 'rgba(17,24,39,0.5)',
+        justifyContent: 'center',
+        paddingHorizontal: 16,
+    },
+    modalCard: {
+        backgroundColor: '#fff',
+        borderRadius: 12,
+        padding: 16,
+        maxHeight: '80%',
+    },
+    modalCardNight: {
+        backgroundColor: 'rgba(2,6,23,0.96)',
+        borderWidth: 1,
+        borderColor: '#334155',
+    },
+    modalList: {
+        maxHeight: 220,
+        marginBottom: 10,
+    },
+    modalSelectedDiary: {
+        backgroundColor: '#ecfdf5',
+    },
+    modalSelectedDiaryNight: {
+        backgroundColor: '#0f172a',
+        borderColor: '#475569',
+    },
+    modalActions: {
+        flexDirection: 'row',
+        gap: 10,
+    }
 });

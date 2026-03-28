@@ -3,6 +3,7 @@ import { nostrClient, type NostrEvent } from '../../lib/nostrClient';
 import { filterAndDeduplicateEvents, deduplicateAndFormatEvents, type FilteredEvent } from '../../lib/eventFilter';
 import { reactionManager } from '../../lib/reactionManager';
 import { threadManager } from '../../lib/threadManager';
+import { perfMonitor, type FeedLoadReason } from '../../lib/perfMonitor';
 
 interface UseFeedControllerParams {
   relayUrls: string[];
@@ -15,8 +16,10 @@ interface UseFeedControllerParams {
 interface UseFeedControllerResult {
   events: FilteredEvent[];
   isLoading: boolean;
-  subscribeFeed: (relayOverride?: string[]) => Promise<void>;
+  isFetchingMore: boolean;
+  subscribeFeed: (relayOverride?: string[], reason?: FeedLoadReason) => Promise<void>;
   refresh: () => void;
+  loadMore: () => Promise<void>;
 }
 
 export function useFeedController({
@@ -28,16 +31,19 @@ export function useFeedController({
 }: UseFeedControllerParams): UseFeedControllerResult {
   const [events, setEvents] = useState<FilteredEvent[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [isFetchingMore, setIsFetchingMore] = useState(false);
   const [currentSubId, setCurrentSubId] = useState<string | null>(null);
   const [initialFeedLoaded, setInitialFeedLoaded] = useState(false);
+  const oldestEventTimestampRef = useRef<number | null>(null);
   const currentSubIdRef = useRef<string | null>(null);
   const requestIdRef = useRef(0);
   const overallTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settleTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamRenderFlushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const interactionQueueRef = useRef<Set<string>>(new Set());
   const interactionFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const clearFeedTimers = useCallback(() => {
+  const clearSubscriptionTimers = useCallback(() => {
     if (overallTimeoutRef.current) {
       clearTimeout(overallTimeoutRef.current);
       overallTimeoutRef.current = null;
@@ -46,6 +52,12 @@ export function useFeedController({
       clearTimeout(settleTimeoutRef.current);
       settleTimeoutRef.current = null;
     }
+    if (streamRenderFlushRef.current) {
+      clearTimeout(streamRenderFlushRef.current);
+      streamRenderFlushRef.current = null;
+    }
+  }, []);
+  const clearInteractionQueue = useCallback(() => {
     if (interactionFlushTimerRef.current) {
       clearTimeout(interactionFlushTimerRef.current);
       interactionFlushTimerRef.current = null;
@@ -53,12 +65,23 @@ export function useFeedController({
     interactionQueueRef.current.clear();
   }, []);
 
+  const updateOldestTimestamp = useCallback((source: NostrEvent[]) => {
+    if (source.length === 0) return;
+    const oldest = Math.min(...source.map((ev) => ev.created_at));
+    if (oldestEventTimestampRef.current === null || oldest < oldestEventTimestampRef.current) {
+      oldestEventTimestampRef.current = oldest;
+    }
+  }, []);
+
   const subscribeFeed = useCallback(
-    async (relayOverride?: string[]) => {
+    async (relayOverride?: string[], reason: FeedLoadReason = 'manual') => {
       const requestId = ++requestIdRef.current;
       try {
-        clearFeedTimers();
+        perfMonitor.startFeedLoad(reason);
+        clearSubscriptionTimers();
+        clearInteractionQueue();
         setIsLoading(true);
+        oldestEventTimestampRef.current = null;
 
         const activeRelays = relayOverride && relayOverride.length > 0 ? relayOverride : relayUrls;
         if (activeRelays.length === 0) {
@@ -81,11 +104,19 @@ export function useFeedController({
         const since = shouldFilter || shouldSearch ? 0 : Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
         const allEvents: NostrEvent[] = [];
         const applyDisplayEvents = (source: NostrEvent[]) => {
+          updateOldestTimestamp(source);
           if (shouldFilter) {
             setEvents(filterAndDeduplicateEvents(source, normalizedHashtags));
             return;
           }
           setEvents(deduplicateAndFormatEvents(source));
+        };
+        const scheduleDisplayRefresh = () => {
+          if (streamRenderFlushRef.current) return;
+          streamRenderFlushRef.current = setTimeout(() => {
+            streamRenderFlushRef.current = null;
+            applyDisplayEvents(allEvents);
+          }, 120);
         };
 
         if (shouldFilter) {
@@ -113,6 +144,7 @@ export function useFeedController({
           if (fallbackEvents.length > 0) {
             applyDisplayEvents(fallbackEvents);
           }
+          perfMonitor.finishFeedLoad();
           setIsLoading(false);
         };
 
@@ -129,7 +161,7 @@ export function useFeedController({
             reactionManager.fetchInteractions(queuedIds, activeRelays).catch(() => {
               // Ignore interaction fetch failures in feed stream.
             });
-          }, 350);
+          }, 180);
         };
 
         overallTimeoutRef.current = setTimeout(() => {
@@ -145,11 +177,13 @@ export function useFeedController({
           since,
           (event) => {
             if (requestId !== requestIdRef.current) return;
-            clearFeedTimers();
+            clearSubscriptionTimers();
             allEvents.push(event);
-            applyDisplayEvents(allEvents);
+            scheduleDisplayRefresh();
 
             setIsLoading(false);
+            perfMonitor.markFeedEventReceived();
+            perfMonitor.finishFeedLoad();
             threadManager.addEvent(event);
             queueInteractionFetch(event.id);
           },
@@ -178,16 +212,18 @@ export function useFeedController({
               // ignore
             });
           } else {
+            perfMonitor.finishFeedLoad();
             setIsLoading(false);
           }
         }, 3000);
       } catch (err) {
         if (requestId !== requestIdRef.current) return;
         onError?.(err instanceof Error ? err.message : 'Failed to subscribe to feed');
+        perfMonitor.finishFeedLoad();
         setIsLoading(false);
       }
     },
-    [clearFeedTimers, relayUrls, hashtags, filterEnabled, onError, searchQuery]
+    [clearInteractionQueue, clearSubscriptionTimers, relayUrls, hashtags, filterEnabled, onError, searchQuery, updateOldestTimestamp]
   );
 
   useEffect(() => {
@@ -197,33 +233,77 @@ export function useFeedController({
   useEffect(() => {
     return () => {
       requestIdRef.current += 1;
-      clearFeedTimers();
+      clearSubscriptionTimers();
+      clearInteractionQueue();
       if (currentSubIdRef.current) {
         nostrClient.unsubscribe(currentSubIdRef.current);
       }
     };
-  }, [clearFeedTimers]);
+  }, [clearInteractionQueue, clearSubscriptionTimers]);
 
   useEffect(() => {
     if (initialFeedLoaded) return;
     if (relayUrls.length === 0) return;
 
     setInitialFeedLoaded(true);
-    subscribeFeed().catch((err) => {
+    subscribeFeed(undefined, 'initial').catch((err) => {
       onError?.(err instanceof Error ? err.message : 'Failed to load initial feed');
     });
   }, [relayUrls, initialFeedLoaded, subscribeFeed, onError]);
 
   const refresh = useCallback(() => {
-    subscribeFeed().catch((err) => {
+    subscribeFeed(undefined, 'refresh').catch((err) => {
       onError?.(err instanceof Error ? err.message : 'Failed to refresh feed');
     });
   }, [subscribeFeed, onError]);
 
+  const loadMore = useCallback(async () => {
+    if (isFetchingMore || isLoading || !oldestEventTimestampRef.current) return;
+
+    setIsFetchingMore(true);
+    try {
+      const until = oldestEventTimestampRef.current - 1;
+      const normalizedHashtags = filterEnabled
+        ? hashtags.map((tag) => tag.trim().toLowerCase()).filter(Boolean)
+        : [];
+      const normalizedSearchQuery = searchQuery?.trim();
+
+      const pageEvents = await nostrClient.fetchFeedPage(
+        normalizedHashtags,
+        50,
+        until,
+        normalizedSearchQuery
+      );
+
+      if (pageEvents.length > 0) {
+        updateOldestTimestamp(pageEvents);
+        
+        let newFiltered: FilteredEvent[];
+        if (filterEnabled && normalizedHashtags.length > 0) {
+          newFiltered = filterAndDeduplicateEvents(pageEvents, normalizedHashtags);
+        } else {
+          newFiltered = deduplicateAndFormatEvents(pageEvents);
+        }
+
+        setEvents((prev) => {
+          const existingIds = new Set(prev.map((ev) => ev.id));
+          const uniqueNew = newFiltered.filter((ev) => !existingIds.has(ev.id));
+          return [...prev, ...uniqueNew];
+        });
+      }
+    } catch (err) {
+      onError?.(err instanceof Error ? err.message : 'Failed to load more events');
+    } finally {
+      setIsFetchingMore(false);
+    }
+  }, [isFetchingMore, isLoading, hashtags, filterEnabled, searchQuery, onError, updateOldestTimestamp]);
+
   return {
     events,
     isLoading,
+    isFetchingMore,
     subscribeFeed,
     refresh,
+    loadMore,
   };
 }

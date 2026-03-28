@@ -2,6 +2,8 @@ import { diagnostics } from './diagnostics';
 import { logger } from './logger';
 import type { Event, Filter } from 'nostr-tools';
 import { SimplePool } from 'nostr-tools';
+import { relayHealthMonitor } from './relayHealthMonitor';
+import { parseNip20Prefix } from './networkResult';
 
 interface BatchRequest {
   id: string;
@@ -122,9 +124,7 @@ export class BatchRequestManager {
     // Group requests by relay URLs to optimize
     const relayGroups = this.groupByRelays(requests);
 
-    for (const [_, groupRequests] of relayGroups) {
-      await this.executeBatchForRelays(groupRequests);
-    }
+    await Promise.all(Array.from(relayGroups.values()).map((groupRequests) => this.executeBatchForRelays(groupRequests)));
 
     // Update stats
     const latency = Date.now() - batchStartTime;
@@ -150,7 +150,7 @@ export class BatchRequestManager {
     const groups = new Map<string, BatchRequest[]>();
 
     for (const request of requests) {
-      const relayKey = request.relayUrls.sort().join(',');
+      const relayKey = [...request.relayUrls].sort().join(',');
       if (!groups.has(relayKey)) {
         groups.set(relayKey, []);
       }
@@ -188,7 +188,10 @@ export class BatchRequestManager {
           onevent: (event: Event) => {
             allEvents.push(event);
           },
-          oneose: () => {
+          oneose: (relay?: string) => {
+            if (relay) {
+              diagnostics.log(`Batch EOSE from ${relay}`, 'info');
+            }
             if (isSettled) return;
             isSettled = true;
             // Distribute events to respective callbacks
@@ -199,6 +202,22 @@ export class BatchRequestManager {
               clearTimeout(timeoutId);
             }
           },
+          onclose: (reasons: string[]) => {
+            reasons.forEach((reason, idx) => {
+              const relay = relayUrls[idx];
+              if (relay && reason) {
+                const prefix = parseNip20Prefix(reason);
+                const prefixLabel = prefix ? ` [${prefix}]` : '';
+                diagnostics.log(`Batch subscription closed by ${relay}${prefixLabel}: ${reason}`, 'warn');
+                
+                if (prefix === 'auth-required') {
+                  relayHealthMonitor.recordFailure(relay, 'Authentication required');
+                } else if (prefix === 'rate-limited') {
+                  relayHealthMonitor.recordFailure(relay, 'Rate limited');
+                }
+              }
+            });
+          }
         }
       );
 

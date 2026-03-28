@@ -10,20 +10,20 @@ interface ReactionBarProps {
   eventAuthor: string;
   authState: AuthState;
   relayUrls: string[];
-  onReactionAdded?: () => void;
 }
 
 export function ReactionBar({ 
   eventId, 
   eventAuthor, 
   authState, 
-  relayUrls,
-  onReactionAdded 
+  relayUrls
 }: ReactionBarProps) {
   const [isReacting, setIsReacting] = useState(false);
   const [showPicker, setShowPicker] = useState(false);
 
   const reactions = reactionManager.getReactions(eventId);
+  const repostCount = reactionManager.getRepostCount(eventId);
+  const zapCount = reactionManager.getZapCount(eventId);
   const canUseBrowserSigner =
     authState.method === 'signer' &&
     typeof window !== 'undefined' &&
@@ -62,10 +62,9 @@ export function ReactionBar({
         );
       }
 
-      // Trigger refresh
-      if (onReactionAdded) {
-        onReactionAdded();
-      }
+      reactionManager.fetchInteractions([eventId], relayUrls).catch(() => {
+        // best-effort refresh
+      });
     } catch (error) {
       Alert.alert('Error', error instanceof Error ? error.message : 'Failed to add reaction');
     } finally {
@@ -76,6 +75,38 @@ export function ReactionBar({
   const userHasReacted = (emoji: string) => {
     if (!authState.pubkey) return false;
     return reactionManager.hasUserReacted(eventId, authState.pubkey, emoji);
+  };
+
+  const userHasReposted = authState.pubkey
+    ? reactionManager.hasUserReposted(eventId, authState.pubkey)
+    : false;
+
+  const handleRepost = async () => {
+    if (!authState.isLoggedIn) {
+      Alert.alert('Login Required', 'You need to login to repost');
+      return;
+    }
+
+    try {
+      setIsReacting(true);
+      if (canUseBrowserSigner) {
+        await reactionManager.publishRepostWithSigner(eventId, eventAuthor, relayUrls);
+      } else {
+        if (authState.isReadOnly || !authState.privkey) {
+          Alert.alert('Login Required', 'Use nsec login or browser signer with signing permission');
+          return;
+        }
+        await reactionManager.publishRepost(eventId, eventAuthor, authState.privkey, relayUrls);
+      }
+
+      reactionManager.fetchInteractions([eventId], relayUrls).catch(() => {
+        // best-effort refresh
+      });
+    } catch (error) {
+      Alert.alert('Error', error instanceof Error ? error.message : 'Failed to repost');
+    } finally {
+      setIsReacting(false);
+    }
   };
 
   return (
@@ -105,6 +136,26 @@ export function ReactionBar({
             disabled={isReacting}
           >
             <Text style={styles.addButtonText}>+</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      <View style={styles.actionsRow}>
+        <View style={[styles.metricBadge, userHasReposted && styles.metricBadgeActive]}>
+          <Text style={styles.metricText}>🔁 {repostCount}</Text>
+        </View>
+        <View style={styles.metricBadge}>
+          <Text style={styles.metricText}>⚡ {zapCount}</Text>
+        </View>
+        {canWriteReaction && (
+          <TouchableOpacity
+            style={[styles.repostButton, userHasReposted && styles.repostButtonActive]}
+            onPress={handleRepost}
+            disabled={isReacting}
+          >
+            <Text style={[styles.repostButtonText, userHasReposted && styles.repostButtonTextActive]}>
+              Repost
+            </Text>
           </TouchableOpacity>
         )}
       </View>
@@ -196,5 +247,45 @@ const styles = StyleSheet.create({
   },
   pickerEmoji: {
     fontSize: 20,
+  },
+  actionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 8,
+  },
+  metricBadge: {
+    backgroundColor: '#f3f4f6',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  metricBadgeActive: {
+    backgroundColor: '#dbeafe',
+  },
+  metricText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#374151',
+  },
+  repostButton: {
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    backgroundColor: '#ffffff',
+  },
+  repostButtonActive: {
+    borderColor: '#2563eb',
+    backgroundColor: '#eff6ff',
+  },
+  repostButtonText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#374151',
+  },
+  repostButtonTextActive: {
+    color: '#1d4ed8',
   },
 });

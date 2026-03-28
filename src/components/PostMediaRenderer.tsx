@@ -16,6 +16,7 @@ interface PostMediaRendererProps {
   textNumberOfLines?: number;
   imageResizeMode?: 'cover' | 'contain';
   singleImageHeight?: number;
+  isNight?: boolean;
 }
 
 interface ViewerState {
@@ -29,6 +30,7 @@ export function PostMediaRenderer({
   textNumberOfLines = 6,
   imageResizeMode = 'cover',
   singleImageHeight,
+  isNight = false,
 }: PostMediaRendererProps) {
   const { width } = useWindowDimensions();
   const viewerScrollRef = useRef<ScrollView | null>(null);
@@ -45,17 +47,41 @@ export function PostMediaRenderer({
       images,
       videos,
       links: parsedFromText.links.filter((url) => !images.includes(url) && !videos.includes(url)),
+      metadata: parsedFromTags.metadata,
     };
   }, [content, tags]);
 
   const [media, setMedia] = useState<ExtractedMedia>(baseMedia);
   const [hiddenImages, setHiddenImages] = useState<Set<string>>(new Set());
+  const [currentUrls, setCurrentUrls] = useState<Record<string, string>>({});
   const [hideVideo, setHideVideo] = useState(false);
   const [viewer, setViewer] = useState<ViewerState | null>(null);
+
+  const handleImageError = (originalUrl: string) => {
+    const meta = media.metadata.find((m) => m.url === originalUrl);
+    const current = currentUrls[originalUrl] || originalUrl;
+
+    const allFallbacks = [...(meta?.fallback || [])];
+    if (meta?.sha256) {
+      // 🌸 Blossom-first: Add common Blossom servers as fallback
+      allFallbacks.push(`https://blossom.wellorder.net/${meta.sha256}`);
+      allFallbacks.push(`https://cdn.nostr.build/${meta.sha256}`);
+    }
+
+    const untriedFallbacks = allFallbacks.filter((f) => f !== current);
+    const nextFallback = untriedFallbacks[0];
+
+    if (nextFallback) {
+      setCurrentUrls((prev) => ({ ...prev, [originalUrl]: nextFallback }));
+    } else {
+      setHiddenImages((prev) => new Set([...prev, originalUrl]));
+    }
+  };
 
   useEffect(() => {
     setMedia(baseMedia);
     setHiddenImages(new Set());
+    setCurrentUrls({});
     setHideVideo(false);
 
     let canceled = false;
@@ -119,7 +145,7 @@ export function PostMediaRenderer({
   return (
     <View>
       {media.cleanedText ? (
-        <Text style={styles.text} numberOfLines={textNumberOfLines}>
+        <Text style={[styles.text, isNight && styles.textNight]} numberOfLines={textNumberOfLines}>
           {media.cleanedText}
         </Text>
       ) : null}
@@ -134,7 +160,8 @@ export function PostMediaRenderer({
                 style={styles.mediaPressable}
               >
                 <Image
-                  source={{ uri: visibleImages[0] }}
+                  source={{ uri: currentUrls[visibleImages[0]] || visibleImages[0] }}
+                  accessibilityLabel={media.metadata.find(m => m.url === visibleImages[0])?.alt || 'Post image'}
                   style={[
                     styles.singleImage,
                     imageResizeMode === 'contain' && styles.singleImageContain,
@@ -143,7 +170,7 @@ export function PostMediaRenderer({
                       : null,
                   ]}
                   resizeMode={imageResizeMode}
-                  onError={() => setHiddenImages(new Set([...hiddenImages, visibleImages[0]]))}
+                  onError={() => handleImageError(visibleImages[0])}
                 />
               </TouchableOpacity>
             </View>
@@ -157,10 +184,11 @@ export function PostMediaRenderer({
                     style={styles.mediaPressable}
                   >
                     <Image
-                      source={{ uri: url }}
+                      source={{ uri: currentUrls[url] || url }}
+                      accessibilityLabel={media.metadata.find(m => m.url === url)?.alt || 'Post image'}
                       style={styles.gridImage}
                       resizeMode="cover"
-                      onError={() => setHiddenImages(new Set([...hiddenImages, url]))}
+                      onError={() => handleImageError(url)}
                     />
                   </TouchableOpacity>
                 </View>
@@ -256,6 +284,9 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     color: '#1f2937',
+  },
+  textNight: {
+    color: '#e2e8f0',
   },
   imageBlock: {
     marginTop: 10,

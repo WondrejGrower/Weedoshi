@@ -3,11 +3,24 @@ export interface ExtractedMedia {
   images: string[];
   videos: string[];
   links: string[];
+  metadata: MediaMetadata[];
+}
+
+export interface MediaMetadata {
+  url: string;
+  type: 'image' | 'video';
+  mime?: string;
+  sha256?: string;
+  dim?: string;
+  size?: number;
+  alt?: string;
+  fallback?: string[];
 }
 
 export interface ParsedTagMedia {
   images: string[];
   videos: string[];
+  metadata: MediaMetadata[];
 }
 
 export interface LinkPreview {
@@ -90,17 +103,18 @@ export function extractMediaFromContent(content: string): ExtractedMedia {
     images: limitedImages,
     videos: limitedVideos,
     links,
+    metadata: [],
   };
 }
 
 function classifyFromMime(url: string, mime?: string): 'image' | 'video' | 'none' {
-  if (!mime) return 'none';
-  const lowered = mime.toLowerCase();
-  if (lowered.startsWith('image/')) return 'image';
-  if (lowered.startsWith('video/')) return 'video';
+  const mimeLower = (mime || '').toLowerCase();
+  if (mimeLower.startsWith('image/')) return 'image';
+  if (mimeLower.startsWith('video/')) return 'video';
 
-  if (isImageUrl(url)) return 'image';
-  if (isVideoUrl(url)) return 'video';
+  const ext = extFromUrl(url);
+  if (IMAGE_EXTENSIONS.includes(ext)) return 'image';
+  if (VIDEO_EXTENSIONS.includes(ext)) return 'video';
   return 'none';
 }
 
@@ -108,42 +122,72 @@ export function parseMediaFromEventTags(event: { tags?: string[][] }): ParsedTag
   const tags = event.tags || [];
   const images: string[] = [];
   const videos: string[] = [];
+  const metadata: MediaMetadata[] = [];
 
   for (const tag of tags) {
     if (!Array.isArray(tag) || tag.length < 2) continue;
     const tagType = tag[0];
 
+    // NIP-94: File Metadata (Alternative to kind:1, uses tags for meta)
     if (tagType === 'url') {
       const url = normalizeUrl(String(tag[1] || ''));
       const mime = typeof tag[2] === 'string' ? tag[2] : undefined;
       const classified = classifyFromMime(url, mime);
+      if (classified === 'none') continue;
+
+      const meta: MediaMetadata = { url, type: classified, mime };
+      const sha256 = tags.find((t) => t[0] === 'x')?.[1];
+      if (sha256) meta.sha256 = sha256;
+      const size = tags.find((t) => t[0] === 'size')?.[1];
+      if (size) meta.size = parseInt(size, 10);
+      const dim = tags.find((t) => t[0] === 'dim')?.[1];
+      if (dim) meta.dim = dim;
+      const alt = tags.find((t) => t[0] === 'alt')?.[1];
+      if (alt) meta.alt = alt;
+
       if (classified === 'image') images.push(url);
       if (classified === 'video') videos.push(url);
+      metadata.push(meta);
       continue;
     }
 
+    // NIP-92: imeta (Inline Metadata for any kind)
     if (tagType === 'imeta') {
-      let url = '';
-      let mime = '';
+      const meta: Partial<MediaMetadata> = {};
       for (let i = 1; i < tag.length; i++) {
         const part = String(tag[i] || '');
-        if (part.startsWith('url ')) {
-          url = normalizeUrl(part.slice(4));
-        }
-        if (part.startsWith('m ')) {
-          mime = part.slice(2);
+        if (part.startsWith('url ')) meta.url = normalizeUrl(part.slice(4));
+        else if (part.startsWith('m ')) meta.mime = part.slice(2);
+        else if (part.startsWith('x ')) meta.sha256 = part.slice(2);
+        else if (part.startsWith('dim ')) meta.dim = part.slice(4);
+        else if (part.startsWith('size ')) meta.size = parseInt(part.slice(5), 10);
+        else if (part.startsWith('alt ')) meta.alt = part.slice(4);
+        else if (part.startsWith('fallback ')) {
+          if (!meta.fallback) meta.fallback = [];
+          meta.fallback.push(normalizeUrl(part.slice(9)));
         }
       }
-      if (!url) continue;
-      const classified = classifyFromMime(url, mime);
-      if (classified === 'image') images.push(url);
-      if (classified === 'video') videos.push(url);
+
+      if (meta.url) {
+        const classified = classifyFromMime(meta.url, meta.mime);
+        if (classified !== 'none') {
+          const finalMeta: MediaMetadata = {
+            url: meta.url,
+            type: classified,
+            ...meta,
+          };
+          if (classified === 'image') images.push(meta.url);
+          if (classified === 'video') videos.push(meta.url);
+          metadata.push(finalMeta);
+        }
+      }
     }
   }
 
   return {
     images: unique(images).slice(0, 4),
     videos: unique(videos).slice(0, 1),
+    metadata: metadata.slice(0, 8),
   };
 }
 
@@ -213,5 +257,6 @@ export async function enhanceMediaWithHead(
     images: unique(nextImages).slice(0, 4),
     videos: unique(nextVideos).slice(0, 1),
     links: unique(stillLinks),
+    metadata: initial.metadata,
   };
 }

@@ -1,0 +1,320 @@
+import { diagnostics } from './diagnostics';
+import { logger } from './logger';
+import { SimplePool } from 'nostr-tools';
+/**
+ * BatchRequestManager optimizes network requests by batching multiple
+ * queries together, reducing round-trips and improving performance
+ */
+export class BatchRequestManager {
+    constructor() {
+        Object.defineProperty(this, "pool", {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: void 0
+        });
+        Object.defineProperty(this, "pendingRequests", {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: []
+        });
+        Object.defineProperty(this, "batchDelay", {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: 100
+        }); // ms - wait before executing batch
+        Object.defineProperty(this, "maxBatchSize", {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: 10
+        }); // max requests per batch
+        Object.defineProperty(this, "batchTimeout", {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: null
+        });
+        Object.defineProperty(this, "stats", {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: {
+                totalBatches: 0,
+                totalRequests: 0,
+                avgBatchSize: 0,
+                totalEventsFetched: 0,
+                avgLatency: 0,
+            }
+        });
+        Object.defineProperty(this, "latencyHistory", {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: []
+        });
+        logger.info('📦 BatchRequestManager: Initializing...');
+        try {
+            this.pool = new SimplePool();
+            logger.info('✅ BatchRequestManager: SimplePool created');
+        }
+        catch (error) {
+            logger.error('🔴 BatchRequestManager: Constructor error:', error);
+            throw error;
+        }
+    }
+    /**
+     * Add a request to the batch queue
+     */
+    addRequest(filters, relayUrls, callback) {
+        const requestId = `batch_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        const request = {
+            id: requestId,
+            filters,
+            relayUrls,
+            callback,
+            timestamp: Date.now(),
+        };
+        this.pendingRequests.push(request);
+        this.stats.totalRequests++;
+        diagnostics.log(`Added request ${requestId} to batch queue (${this.pendingRequests.length} pending)`, 'info');
+        // Schedule batch execution
+        this.scheduleBatchExecution();
+        return requestId;
+    }
+    /**
+     * Schedule batch execution with debouncing
+     */
+    scheduleBatchExecution() {
+        // Clear existing timeout
+        if (this.batchTimeout !== null) {
+            clearTimeout(this.batchTimeout);
+        }
+        // Execute immediately if we hit max batch size
+        if (this.pendingRequests.length >= this.maxBatchSize) {
+            this.executeBatch();
+            return;
+        }
+        // Otherwise, wait for more requests
+        this.batchTimeout = setTimeout(() => {
+            this.executeBatch();
+        }, this.batchDelay);
+    }
+    /**
+     * Execute batched requests
+     */
+    async executeBatch() {
+        if (this.pendingRequests.length === 0)
+            return;
+        const batchStartTime = Date.now();
+        const requests = [...this.pendingRequests];
+        this.pendingRequests = [];
+        this.batchTimeout = null;
+        this.stats.totalBatches++;
+        const batchSize = requests.length;
+        diagnostics.log(`Executing batch of ${batchSize} requests`, 'info');
+        logger.info(`📦 Batch execution: ${batchSize} requests`);
+        // Group requests by relay URLs to optimize
+        const relayGroups = this.groupByRelays(requests);
+        await Promise.all(Array.from(relayGroups.values()).map((groupRequests) => this.executeBatchForRelays(groupRequests)));
+        // Update stats
+        const latency = Date.now() - batchStartTime;
+        this.latencyHistory.push(latency);
+        if (this.latencyHistory.length > 10) {
+            this.latencyHistory.shift();
+        }
+        const avgLatency = this.latencyHistory.reduce((a, b) => a + b, 0) / this.latencyHistory.length;
+        this.stats.avgLatency = Math.round(avgLatency);
+        this.stats.avgBatchSize = this.stats.totalRequests / this.stats.totalBatches;
+        diagnostics.log(`Batch completed in ${latency}ms (avg: ${this.stats.avgLatency}ms)`, 'info');
+    }
+    /**
+     * Group requests by relay URLs for optimization
+     */
+    groupByRelays(requests) {
+        const groups = new Map();
+        for (const request of requests) {
+            const relayKey = [...request.relayUrls].sort().join(',');
+            if (!groups.has(relayKey)) {
+                groups.set(relayKey, []);
+            }
+            groups.get(relayKey).push(request);
+        }
+        return groups;
+    }
+    /**
+     * Execute batch for a specific set of relays
+     */
+    async executeBatchForRelays(requests) {
+        if (requests.length === 0)
+            return;
+        const relayUrls = requests[0].relayUrls;
+        // Combine all filters
+        const combinedFilters = [];
+        for (const request of requests) {
+            combinedFilters.push(...request.filters);
+        }
+        try {
+            const allEvents = [];
+            let isSettled = false;
+            let timeoutId = null;
+            // Subscribe with combined filters
+            const sub = this.pool.subscribeMany(relayUrls, combinedFilters, {
+                onevent: (event) => {
+                    allEvents.push(event);
+                },
+                oneose: () => {
+                    if (isSettled)
+                        return;
+                    isSettled = true;
+                    // Distribute events to respective callbacks
+                    this.distributeEvents(requests, allEvents);
+                    this.stats.totalEventsFetched += allEvents.length;
+                    sub.close();
+                    if (timeoutId) {
+                        clearTimeout(timeoutId);
+                    }
+                },
+            });
+            // Timeout after 3 seconds
+            timeoutId = setTimeout(() => {
+                if (isSettled)
+                    return;
+                isSettled = true;
+                sub.close();
+                if (allEvents.length > 0) {
+                    this.distributeEvents(requests, allEvents);
+                    this.stats.totalEventsFetched += allEvents.length;
+                    return;
+                }
+                // No events: still resolve requests once with an empty result
+                this.distributeEvents(requests, []);
+            }, 3000);
+        }
+        catch (error) {
+            diagnostics.log(`Batch execution error: ${error}`, 'error');
+            // Notify all callbacks with empty results
+            for (const request of requests) {
+                request.callback([]);
+            }
+        }
+    }
+    /**
+     * Distribute fetched events to respective callbacks based on filters
+     */
+    distributeEvents(requests, allEvents) {
+        for (const request of requests) {
+            // Filter events that match this request's filters
+            const matchingEvents = allEvents.filter(event => this.eventMatchesFilters(event, request.filters));
+            request.callback(matchingEvents);
+            const latency = Date.now() - request.timestamp;
+            diagnostics.log(`Request ${request.id} received ${matchingEvents.length} events in ${latency}ms`, 'info');
+        }
+    }
+    /**
+     * Check if an event matches any of the given filters
+     */
+    eventMatchesFilters(event, filters) {
+        for (const filter of filters) {
+            if (this.eventMatchesFilter(event, filter)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /**
+     * Check if an event matches a specific filter
+     */
+    eventMatchesFilter(event, filter) {
+        // Check kinds
+        if (filter.kinds && !filter.kinds.includes(event.kind)) {
+            return false;
+        }
+        // Check authors
+        if (filter.authors && !filter.authors.includes(event.pubkey)) {
+            return false;
+        }
+        // Check IDs
+        if (filter.ids && !filter.ids.includes(event.id)) {
+            return false;
+        }
+        // Check #e tags
+        if (filter['#e']) {
+            const eTags = event.tags.filter(tag => tag[0] === 'e').map(tag => tag[1]);
+            const hasMatch = filter['#e'].some(eId => eTags.includes(eId));
+            if (!hasMatch)
+                return false;
+        }
+        // Check #p tags
+        if (filter['#p']) {
+            const pTags = event.tags.filter(tag => tag[0] === 'p').map(tag => tag[1]);
+            const hasMatch = filter['#p'].some(pId => pTags.includes(pId));
+            if (!hasMatch)
+                return false;
+        }
+        // Check since
+        if (filter.since && event.created_at < filter.since) {
+            return false;
+        }
+        // Check until
+        if (filter.until && event.created_at > filter.until) {
+            return false;
+        }
+        return true;
+    }
+    /**
+     * Get batch statistics
+     */
+    getStats() {
+        return { ...this.stats };
+    }
+    /**
+     * Get pending request count
+     */
+    getPendingCount() {
+        return this.pendingRequests.length;
+    }
+    /**
+     * Set batch delay (ms)
+     */
+    setBatchDelay(delayMs) {
+        this.batchDelay = Math.max(10, Math.min(1000, delayMs)); // 10-1000ms
+        diagnostics.log(`Batch delay set to ${this.batchDelay}ms`, 'info');
+    }
+    /**
+     * Set max batch size
+     */
+    setMaxBatchSize(size) {
+        this.maxBatchSize = Math.max(1, Math.min(50, size)); // 1-50
+        diagnostics.log(`Max batch size set to ${this.maxBatchSize}`, 'info');
+    }
+    /**
+     * Clear pending requests
+     */
+    clear() {
+        this.pendingRequests = [];
+        if (this.batchTimeout !== null) {
+            clearTimeout(this.batchTimeout);
+            this.batchTimeout = null;
+        }
+        diagnostics.log('Cleared all pending batch requests', 'info');
+    }
+    /**
+     * Reset statistics
+     */
+    resetStats() {
+        this.stats = {
+            totalBatches: 0,
+            totalRequests: 0,
+            avgBatchSize: 0,
+            totalEventsFetched: 0,
+            avgLatency: 0,
+        };
+        this.latencyHistory = [];
+        diagnostics.log('Reset batch statistics', 'info');
+    }
+}
+// Singleton instance
+export const batchRequestManager = new BatchRequestManager();

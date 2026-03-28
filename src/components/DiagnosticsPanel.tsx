@@ -1,14 +1,16 @@
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { nostrClient } from '../lib/nostrClient';
 import { eventDeduplicator } from '../lib/eventDeduplicator';
 import { eventValidator } from '../lib/eventValidator';
 import { eventCache } from '../lib/eventCache';
 import { batchRequestManager } from '../lib/batchRequestManager';
 import type { RelayHealth } from '../lib/relayHealthMonitor';
+import { perfMonitor } from '../lib/perfMonitor';
 
 export function DiagnosticsPanel() {
   const [isExpanded, setIsExpanded] = useState(false);
+  const [, setTick] = useState(0);
 
   const relayHealth = nostrClient.getRelayHealth();
   const relayStats = nostrClient.getRelayStats();
@@ -16,6 +18,13 @@ export function DiagnosticsPanel() {
   const validatorStats = eventValidator.getStats();
   const cacheStats = eventCache.getStats();
   const batchStats = batchRequestManager.getStats();
+  const perfStats = perfMonitor.getSnapshot();
+
+  useEffect(() => {
+    if (!isExpanded) return;
+    const interval = setInterval(() => setTick((prev) => prev + 1), 1000);
+    return () => clearInterval(interval);
+  }, [isExpanded]);
 
   const getStatusEmoji = (status: RelayHealth['status']) => {
     switch (status) {
@@ -214,6 +223,58 @@ export function DiagnosticsPanel() {
             </View>
           </View>
         </View>
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>⏱ Runtime Perf</Text>
+          <View style={styles.statsGrid}>
+            <View style={styles.statBox}>
+              <Text style={styles.statValue}>
+                {perfStats.feed.initialLoadMs === null ? '—' : `${perfStats.feed.initialLoadMs}ms`}
+              </Text>
+              <Text style={styles.statLabel}>Initial Feed</Text>
+            </View>
+            <View style={styles.statBox}>
+              <Text style={styles.statValue}>
+                {perfStats.feed.refreshLoadMs === null ? '—' : `${perfStats.feed.refreshLoadMs}ms`}
+              </Text>
+              <Text style={styles.statLabel}>Refresh Feed</Text>
+            </View>
+            <View style={styles.statBox}>
+              <Text style={styles.statValue}>
+                {perfStats.feed.firstEventMs === null ? '—' : `${perfStats.feed.firstEventMs}ms`}
+              </Text>
+              <Text style={styles.statLabel}>First Event</Text>
+            </View>
+            <View style={styles.statBox}>
+              <Text style={styles.statValue}>
+                {perfStats.ui.scrollFps === null ? '—' : perfStats.ui.scrollFps.toFixed(1)}
+              </Text>
+              <Text style={styles.statLabel}>Scroll FPS</Text>
+            </View>
+          </View>
+          <View style={styles.statsGrid}>
+            <View style={styles.statBox}>
+              <Text style={styles.statValue}>{perfStats.network.queryCalls}</Text>
+              <Text style={styles.statLabel}>Query Calls</Text>
+            </View>
+            <View style={styles.statBox}>
+              <Text style={styles.statValue}>{perfStats.network.subscribeCalls}</Text>
+              <Text style={styles.statLabel}>Subscribes</Text>
+            </View>
+            <View style={styles.statBox}>
+              <Text style={styles.statValue}>{perfStats.network.eventsReceived}</Text>
+              <Text style={styles.statLabel}>Net Events</Text>
+            </View>
+            <View style={styles.statBox}>
+              <Text style={styles.statValue}>
+                {perfStats.network.avgQueryMs === null ? '—' : `${perfStats.network.avgQueryMs.toFixed(0)}ms`}
+              </Text>
+              <Text style={styles.statLabel}>Avg Query</Text>
+            </View>
+          </View>
+          <TouchableOpacity style={styles.clearBtn} onPress={() => perfMonitor.reset()}>
+            <Text style={styles.clearBtnText}>Reset Perf Counters</Text>
+          </TouchableOpacity>
+        </View>
         {/* Best Relay */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>🏆 Best Relay</Text>
@@ -289,6 +350,21 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#374151',
     marginBottom: 10,
+  },
+  clearBtn: {
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    alignSelf: 'flex-start',
+    backgroundColor: '#f9fafb',
+  },
+  clearBtnText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#374151',
   },
   statsGrid: {
     flexDirection: 'row',

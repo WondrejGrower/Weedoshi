@@ -2,6 +2,8 @@ import type { AuthState } from '../../lib/authManager';
 import type { NostrProfileMetadata } from '../../lib/nostrClient';
 import type { DiaryEntry, DiaryIndex } from '../../lib/diaryManager';
 const PHASE_WEEK_SEPARATOR = ' :: ';
+type DiaryPhaseItem = { phaseLabel?: string; createdAt?: number; addedAt?: number };
+type DiaryPhaseLike = { phase?: string; items?: DiaryPhaseItem[] };
 
 export function getDisplayName(auth: AuthState, metadata: NostrProfileMetadata | null): string {
   if (metadata?.display_name?.trim()) return metadata.display_name.trim();
@@ -54,4 +56,23 @@ function formatDiaryChapterLabel(value: string): string {
     return `${left} • Week ${right}`;
   }
   return left || right || 'General';
+}
+
+function normalizePhaseFromLabel(value?: string): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.includes(PHASE_WEEK_SEPARATOR)
+    ? value.split(PHASE_WEEK_SEPARATOR)[0]?.trim()
+    : value.trim();
+  return normalized || undefined;
+}
+
+export function getDiaryPhaseDisplay(diary: DiaryPhaseLike): string | undefined {
+  if (diary.phase?.trim()) return diary.phase.trim();
+  const items = Array.isArray(diary.items) ? diary.items : [];
+  if (items.length === 0) return undefined;
+  const newestWithPhase = [...items]
+    .sort((a, b) => (b.createdAt || b.addedAt || 0) - (a.createdAt || a.addedAt || 0))
+    .map((item) => normalizePhaseFromLabel(item.phaseLabel))
+    .find((phase) => Boolean(phase));
+  return newestWithPhase || undefined;
 }
